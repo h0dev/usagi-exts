@@ -117,7 +117,7 @@ internal class CuuTruyenParser(context: MangaLoaderContext) :
                     SortOrder.POPULARITY_WEEK -> append("/top?duration=week")
                     SortOrder.POPULARITY_MONTH -> append("/top?duration=month")
                     SortOrder.NEWEST -> {
-                        // clear old buildString
+                        // /home_a is a top-level endpoint, not nested under /mangas
                         clear()
                         append("/home_a")
                     }
