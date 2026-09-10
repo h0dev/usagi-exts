@@ -148,8 +148,9 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 			query["genre"] = tag.key
 		}
 
-		if (!filter.query.isNullOrEmpty()) {
-			query["textSearch"] = filter.query
+		val textSearch = filter.query
+		if (!textSearch.isNullOrEmpty()) {
+			query["textSearch"] = textSearch
 		}
 
 		return fetchListPage(query)
