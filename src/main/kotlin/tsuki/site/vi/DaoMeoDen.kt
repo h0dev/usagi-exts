@@ -15,6 +15,8 @@ import tsuki.network.OkHttpWebClient
 import tsuki.util.*
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration.Companion.seconds
 
 @MangaSourceParser("DAOMEODEN", "Đảo Mèo Đen", "vi")
 internal class DaoMeoDen(context: MangaLoaderContext) :
@@ -22,9 +24,17 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 
 	override val configKeyDomain = ConfigKey.Domain("daomeoden.net")
 
+	/**
+	 * The site tolerates bursts but blocks sustained hammering. Tsuki's rateLimit
+	 * throws TooManyRequestExceptions instead of waiting, so the window has to be
+	 * generous: opening a manga costs 3 requests (details page, reader page, content
+	 * POST) and reading a chapter on top of browsing easily reaches 6.
+	 * Keiyoushi sets 3 requests per *second*; matching that here avoids tripping the
+	 * limiter between getDetails and getPages.
+	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
-			.rateLimit(3)
+			.rateLimit(30, 1.seconds)
 			.build(),
 		source,
 	)
@@ -162,6 +172,18 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 		val url = manga.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(url).parseHtml()
 
+		// The page token is stable for the whole session, so remembering it here
+		// lets getPages skip re-fetching the reader page just to read it again.
+		// Detail URLs end with -0.html while chapter URLs use the bare slug, so
+		// both are trimmed to the same key.
+		doc.html().findScriptVariable("_token")?.let { token ->
+			manga.url.substringAfterLast('/')
+				.removeSuffix(".html")
+				.removeSuffix("-0")
+				.takeIf { it.isNotBlank() }
+				?.let { slug -> tokenCache[slug] = token }
+		}
+
 		val tags = doc.select("div.info-tag.tag-genre span")
 			.mapNotNullToSet { span ->
 				val title = span.textOrNull()?.takeIf { it.isNotBlank() } ?: return@mapNotNullToSet null
@@ -225,13 +247,20 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val url = chapter.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(url).parseHtml()
-		val html = doc.html()
 
-		val chapterId = html.findScriptVariable("chapterId")
-			?: throw ParseException("chapterId not found", url)
-		val token = html.findScriptVariable("_token")
-			?: throw ParseException("Token not found", url)
+		// Chapter URLs look like /doc-truyen-tranh/<slug>/chuong-<n>-<chapterId>-0.html,
+		// so the chapter id and its manga slug can be read straight off the URL.
+		val slug = chapter.url.trim('/').split('/').getOrNull(1)
+		val chapterId = regexChapterId.find(chapter.url)?.groupValues?.get(1)
+
+		val token = slug?.let { tokenCache[it] } ?: run {
+			// Cache miss (e.g. the chapter was opened straight from a link):
+			// fall back to reading the token off the reader page.
+			webClient.httpGet(url).parseHtml().html().findScriptVariable("_token")
+				?: throw ParseException("Token not found", url)
+		}
+
+		if (chapterId == null) throw ParseException("Chapter id not found", url)
 
 		val payload = webClient.httpPost(
 			"https://$domain/apps/controllers/book/bookChapterContent.php".toHttpUrl(),
@@ -305,12 +334,16 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 		}
 	}
 
+	private val tokenCache = ConcurrentHashMap<String, String>()
+
 	private companion object {
 		const val LIST_PATH = "/danh-sach-truyen-tranh.html"
 		const val CHAPTER_COOKIES = "W10="
 
 		val regexOpenUrl = Regex("""openUrl\('([^']+)'\)""")
 		val regexChapterNumber = Regex("""\d+(?:\.\d+)?""")
+		// .../chuong-<number>-<chapterId>-0.html
+		val regexChapterId = Regex("""chuong-[\d.]+-(\d+)-0\.html""")
 
 		val DEFAULTS = mapOf(
 			"status" to "0",
