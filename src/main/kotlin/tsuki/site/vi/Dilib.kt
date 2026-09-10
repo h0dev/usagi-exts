@@ -11,6 +11,7 @@ import tsuki.model.*
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
 import tsuki.util.*
+import java.util.EnumSet
 import kotlin.time.Duration.Companion.seconds
 
 @MangaSourceParser("DILIB", "Dilib", "vi")
