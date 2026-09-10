@@ -147,8 +147,6 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 		}
 	}
 
-	override val sortOrders: Set<SortOrder> = availableSortOrders
-
 	// ============================== Details ==============================
 
 	override suspend fun getDetails(manga: Manga): Manga {
@@ -286,7 +284,7 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 		val fingerprint = initialData.getJSONObject("fingerprint")
 		val serverMemo = initialData.getJSONObject("serverMemo")
 
-		val password = config[gatePasswordKey].ifBlank { "5" }
+		val password = config[gatePasswordKey]?.ifBlank { "5" } ?: "5"
 		val payload = """
 			{"fingerprint":$fingerprint,"serverMemo":$serverMemo,"updates":[{"type":"syncInput","payload":{"id":"s1","name":"password","value":"$password"}},{"type":"callMethod","payload":{"id":"c1","method":"submit","params":[]}}]}
 		""".trimIndent()
