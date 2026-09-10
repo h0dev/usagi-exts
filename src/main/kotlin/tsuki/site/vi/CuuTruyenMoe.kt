@@ -18,6 +18,7 @@ import tsuki.model.*
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
 import tsuki.util.*
+import tsuki.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.time.Duration.Companion.seconds
@@ -43,6 +44,8 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 		),
 		defaultValue = "5",
 	)
+
+	private val availableTagsKey = suspendLazy(initializer = ::fetchTags)
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -71,7 +74,7 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = availableTags(),
+		availableTags = availableTagsKey.get(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
 	)
 
@@ -318,7 +321,7 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 
 	// ============================== Utils ==============================
 
-	private suspend fun availableTags(): Set<MangaTag> {
+	private suspend fun fetchTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain/tim-kiem").parseHtml()
 		return doc.select("label[\\@click]")
 			.mapNotNullToSet { label ->
