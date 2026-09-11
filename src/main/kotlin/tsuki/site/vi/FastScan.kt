@@ -181,7 +181,7 @@ internal class FastScan(context: MangaLoaderContext) :
 				MangaChapter(
 					id = generateUid(href),
 					title = link.textOrNull()?.trim(),
-					number = regexChapterNumber.find(link.text()).value.toFloatOrNull() ?: 0f,
+					number = regexChapterNumber.find(link.text())?.value?.toFloatOrNull() ?: 0f,
 					volume = 0,
 					url = href,
 					scanlator = null,
