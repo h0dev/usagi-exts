@@ -252,7 +252,17 @@ internal class Dilib(context: MangaLoaderContext) :
 
 	// ============================== Utils ==============================
 
-	private fun String.normalizeImageUrl(): String = if (startsWith("//")) "https:$this" else this
+	/**
+	 * Image urls come in three shapes: protocol relative ("//host/x.jpg", seen on
+	 * the listing thumbnails), root relative ("/img/news/...", used by the detail
+	 * cover and chapter pages) and absolute. Only the first was handled before,
+	 * which made the reader look for "/img/..." on the device itself.
+	 */
+	private fun String.normalizeImageUrl(): String = when {
+		startsWith("//") -> "https:$this"
+		startsWith("/") -> toAbsoluteUrl(domain)
+		else -> this
+	}
 
 	private companion object {
 		const val SEARCH_PATH = "/search.php"
