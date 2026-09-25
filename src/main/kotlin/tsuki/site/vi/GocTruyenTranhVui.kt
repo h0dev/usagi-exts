@@ -3,6 +3,7 @@ package tsuki.site.vi
 import androidx.collection.arraySetOf
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okio.ByteString.Companion.decodeBase64
 import org.json.JSONObject
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
@@ -16,10 +17,14 @@ import tsuki.network.OkHttpWebClient
 import tsuki.util.*
 import java.util.*
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 
 private const val PAGE_SIZE = 30
 private const val CHAPTER_SEPARATOR = "/chuong-"
 private const val AUTH_MESSAGE = "Phiên làm việc đã hết hạn, vui lòng đăng nhập lại"
+private const val BEARER_PREFIX = "Bearer "
+private const val AUTHORIZATION_KEY = "Authorization"
+private const val USER_INFO_KEY = "user_info"
 
 private val COMIC_ID_REGEX = Regex("""id:\s*"([^"]+)"""")
 private val COMIC_NAME_REGEX = Regex("""nameEn:\s*`([^`]+)`""")
@@ -65,7 +70,6 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	private val baseUrl: String get() = "https://$domain"
 
 	private var cachedToken: String? = null
-	private var tokenLoaded = false
 	private var cachedCategories: Set<MangaTag>? = null
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -96,28 +100,51 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	override val authUrl: String
 		get() = "$baseUrl/"
 
-	override suspend fun isAuthorized(): Boolean = authToken() != null
+	override suspend fun isAuthorized(): Boolean {
+		val token = readToken() ?: return false
+		// an expired token must not keep the "sign in" row of the app disabled forever
+		return !token.isExpiredJwt()
+	}
 
 	override suspend fun getUsername(): String {
-		val name = localStorage("user_info")?.let { raw ->
+		val name = localStorage(USER_INFO_KEY)?.let { raw ->
 			runCatching { JSONObject(raw).optString("name") }.getOrNull()
 		}
 		if (name.isNullOrBlank()) {
-			throw AuthRequiredException(source, IllegalStateException("Chưa đăng nhập"))
+			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
 		}
 		return name
 	}
 
 	/**
 	 * The site stores the ready-to-use header value in the local storage, so it is passed
-	 * to the API as is — no need to build a "Bearer" prefix ourselves.
+	 * to the API as is — there is no need to build a "Bearer" prefix ourselves.
+	 *
+	 * The value is re-read on every check instead of being cached forever: the site
+	 * rewrites it on sign in/out and the user signs in *after* the first check, so a
+	 * cached "no token" would hide the account for the rest of the session.
 	 */
-	private suspend fun authToken(forceRefresh: Boolean = false): String? {
-		if (forceRefresh || !tokenLoaded) {
-			cachedToken = localStorage("Authorization")
-			tokenLoaded = true
-		}
-		return cachedToken
+	private suspend fun readToken(): String? = localStorage(AUTHORIZATION_KEY)
+		.also { cachedToken = it }
+
+	private suspend fun currentToken(forceRefresh: Boolean = false): String? =
+		if (forceRefresh) readToken() else cachedToken ?: readToken()
+
+	/**
+	 * The site hands out "Bearer <jwt>", so the expiration date can be checked locally.
+	 * Anything else (or a token we cannot read) is taken as valid.
+	 */
+	private fun String.isExpiredJwt(): Boolean {
+		val payload = substringAfter(BEARER_PREFIX, this)
+			.trim()
+			.split('.')
+			.getOrNull(1)
+			?.decodeBase64()
+			?.utf8()
+			?.let { runCatching { JSONObject(it) }.getOrNull() }
+			?: return false
+		val expiresAt = payload.optLong("exp", 0L)
+		return expiresAt > 0L && expiresAt * 1_000L <= System.currentTimeMillis()
 	}
 
 	private suspend fun localStorage(key: String): String? = runCatching {
@@ -132,7 +159,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	private suspend fun apiHeaders(): Headers = Headers.Builder()
 		.add(CommonHeaders.REFERER, "$baseUrl/")
 		.add(CommonHeaders.X_REQUESTED_WITH, "XMLHttpRequest")
-		.apply { authToken()?.let { add(CommonHeaders.AUTHORIZATION, it) } }
+		.apply { currentToken()?.let { add(CommonHeaders.AUTHORIZATION, it) } }
 		.build()
 
 	// endregion
@@ -229,39 +256,59 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	}
 
 	private suspend fun loadChapters(comicId: String, slug: String): List<MangaChapter> {
-		if (authToken() == null) {
+		if (currentToken() == null) {
 			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
 		}
 
-		val json = webClient
-			.httpGet("$baseUrl/api/comic/$comicId/chapter?limit=-1", apiHeaders())
-			.parseJson()
+		var error: String? = null
 
-		val result = json.optJSONObject("result")
-			?: throw AuthRequiredException(source, IllegalStateException(json.errorMessage()))
-		val chapters = result.optJSONArray("chapters") ?: return emptyList()
-
-		// the api returns chapters from the newest to the oldest one
-		return chapters.mapChapters(reversed = true) { _, item ->
-			val number = item.optString("numberChapter")
-			val title = item.optString("name")
-			MangaChapter(
-				id = generateUid("/truyen/$slug/chuong-$number"),
-				title = title.takeUnless { it.isBlank() || it == "N/A" } ?: "Chương $number",
-				number = number.toFloatOrNull() ?: -1f,
-				volume = 0,
-				url = "/truyen/$slug/chuong-$number#$comicId",
-				scanlator = null,
-				uploadDate = item.optLong("updateTime", 0L),
-				branch = null,
-				source = source,
-			)
+		suspend fun requestChapters(): List<MangaChapter>? = try {
+			val json = webClient
+				.httpGet("$baseUrl/api/comic/$comicId/chapter?limit=-1", apiHeaders())
+				.parseJson()
+			val result = json.optJSONObject("result")
+			if (result == null) {
+				error = json.errorMessage()
+				null
+			} else {
+				// the api returns chapters from the newest to the oldest one
+				result.optJSONArray("chapters")?.mapChapters(reversed = true) { _, item ->
+					val number = item.optString("numberChapter")
+					val title = item.optString("name")
+					MangaChapter(
+						id = generateUid("/truyen/$slug/chuong-$number"),
+						title = title.takeUnless { it.isBlank() || it == "N/A" } ?: "Chương $number",
+						number = number.toFloatOrNull() ?: -1f,
+						volume = 0,
+						url = "/truyen/$slug/chuong-$number#$comicId",
+						scanlator = null,
+						uploadDate = item.optLong("updateTime", 0L),
+						branch = null,
+						source = source,
+					)
+				} ?: emptyList()
+			}
+		} catch (e: CancellationException) {
+			throw e
+		} catch (e: Exception) {
+			error = e.message
+			null
 		}
+
+		var chapters = requestChapters()
+		if (chapters == null) {
+			// the session may have expired — the user could have signed in again in the WebView
+			currentToken(forceRefresh = true)
+			chapters = requestChapters()
+		}
+
+		return chapters
+			?: throw AuthRequiredException(source, IllegalStateException(error ?: AUTH_MESSAGE))
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val ref = chapterRef(chapter)
-		if (authToken() == null) {
+		if (currentToken() == null) {
 			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
 		}
 
@@ -288,6 +335,8 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 					)
 				}
 			}
+		} catch (e: CancellationException) {
+			throw e
 		} catch (_: Exception) {
 			null
 		}
@@ -295,7 +344,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		var pages = requestPages()
 		if (pages == null) {
 			// the stored token may have expired — pick the fresh one up and warm up the cookies
-			authToken(forceRefresh = true)
+			currentToken(forceRefresh = true)
 			runCatching { webClient.httpGet("$baseUrl/truyen/${ref.slug}") }.getOrNull()?.close()
 			pages = requestPages()
 		}
