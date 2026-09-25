@@ -3,46 +3,70 @@ package tsuki.site.vi
 import androidx.collection.arraySetOf
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONObject
 import tsuki.MangaLoaderContext
+import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
-import tsuki.model.*
-import tsuki.util.*
-import org.json.JSONObject
-import tsuki.Broken
-import tsuki.MangaParserAuthProvider
 import tsuki.exception.AuthRequiredException
+import tsuki.model.*
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
-import tsuki.util.json.asTypedList
+import tsuki.util.*
 import java.util.*
-import kotlin.collections.map
+import kotlin.time.Duration.Companion.seconds
 
-@Broken("Bye")
+private const val PAGE_SIZE = 30
+private const val CHAPTER_SEPARATOR = "/chuong-"
+private const val AUTH_MESSAGE = "Phiên làm việc đã hết hạn, vui lòng đăng nhập lại"
+
+private val COMIC_ID_REGEX = Regex("""id:\s*"([^"]+)"""")
+private val COMIC_NAME_REGEX = Regex("""nameEn:\s*`([^`]+)`""")
+
+/**
+ * Góc Truyện Tranh Vui — https://goctruyentranhvui41.com
+ *
+ * The site is a Vue app on top of a JSON API (`/api/v2/...`). Browsing works anonymously,
+ * but the chapter list (`/api/comic/<id>/chapter`) and the page list
+ * (`/api/chapter/loadAll`) require an account: the site keeps the whole `Authorization`
+ * header value ("Bearer ...") in the local storage and sends it with every request.
+ *
+ * So the parser reads that value from the WebView storage (see [MangaParserAuthProvider])
+ * and reuses it for its own requests; when the value is missing, [AuthRequiredException]
+ * is thrown so the app offers the WebView login.
+ */
 @MangaSourceParser("GOCTRUYENTRANHVUI", "Góc Truyện Tranh Vui", "vi")
 internal class GocTruyenTranhVui(context: MangaLoaderContext):
-    PagedMangaParser(context, MangaParserSource.GOCTRUYENTRANHVUI, 50), MangaParserAuthProvider {
+	PagedMangaParser(context, MangaParserSource.GOCTRUYENTRANHVUI, PAGE_SIZE), MangaParserAuthProvider {
 
+	/**
+	 * Tsuki's rateLimit throws TooManyRequestExceptions instead of waiting, so the window
+	 * has to be generous: opening a manga costs 3 requests (details page, chapter api,
+	 * pages api) and that is reached right away when the user starts reading.
+	 * Keiyoushi asks for 3 requests per *second*; Mihon waits, Tsuki does not.
+	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
-			.rateLimit(3)
+			.rateLimit(30, 1.seconds)
 			.build(),
 		source,
 	)
 
-    override val configKeyDomain = ConfigKey.Domain("goctruyentranhvui30.com")
+	override val configKeyDomain = ConfigKey.Domain(
+		"goctruyentranhvui41.com",
+		"goctruyentranhvui30.com",
+	)
+
 	override val userAgentKey = ConfigKey.UserAgent(
 		"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.46 Mobile Safari/537.36",
 	)
-    private val apiUrl by lazy { "https://$domain/api/v2" }
-	private var userToken: String = ""
 
-	private fun apiHeaders(): Headers = Headers.Builder()
-		.add(CommonHeaders.AUTHORIZATION, userToken)
-		.add(CommonHeaders.REFERER, "https://$domain/")
-		.add(CommonHeaders.X_REQUESTED_WITH, "XMLHttpRequest")
-		.build()
+	private val baseUrl: String get() = "https://$domain"
+
+	private var cachedToken: String? = null
+	private var tokenLoaded = false
+	private var cachedCategories: Set<MangaTag>? = null
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -50,281 +74,406 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	}
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
-        SortOrder.UPDATED,
-        SortOrder.POPULARITY,
-        SortOrder.NEWEST,
-        SortOrder.RATING,
-    )
+		SortOrder.UPDATED,
+		SortOrder.POPULARITY,
+		SortOrder.RATING,
+		SortOrder.NEWEST,
+	)
 
-    override val filterCapabilities = MangaListFilterCapabilities(
-        isSearchSupported = true,
-        isMultipleTagsSupported = true,
-    )
+	override val filterCapabilities = MangaListFilterCapabilities(
+		isSearchSupported = true,
+		isMultipleTagsSupported = true,
+		isSearchWithFiltersSupported = true,
+	)
 
-    override suspend fun getFilterOptions() = MangaListFilterOptions(
-        availableTags = availableTags(),
-        availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED)
-    )
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
+		availableTags = loadCategories(),
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
+	)
+
+	// region authorization
 
 	override val authUrl: String
-		get() = domain
+		get() = "$baseUrl/"
 
-	override suspend fun isAuthorized(): Boolean {
-		val token = loadAuthToken(domain)
-		if (token.isNotBlank()) {
-			userToken = token
-			return true
-		}
-		return false
-	}
+	override suspend fun isAuthorized(): Boolean = authToken() != null
 
 	override suspend fun getUsername(): String {
-		val raw = WebViewHelper(context)
-			.getLocalStorageValue(domain, "user_info")
-			?.removeSurrounding('"')
-			?.trim()
-
-		if (raw.isNullOrBlank()) {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException("user_info not found in Local Storage")
-			)
+		val name = localStorage("user_info")?.let { raw ->
+			runCatching { JSONObject(raw).optString("name") }.getOrNull()
 		}
-
-		val localStorage = try {
-			JSONObject(raw)
-		} catch (e: Exception) {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException("Invalid user_info JSON", e)
-			)
+		if (name.isNullOrBlank()) {
+			throw AuthRequiredException(source, IllegalStateException("Chưa đăng nhập"))
 		}
-
-		val name = localStorage.optString("name")
-		if (name.isBlank()) {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException("Username not found")
-			)
-		}
-
 		return name
 	}
 
+	/**
+	 * The site stores the ready-to-use header value in the local storage, so it is passed
+	 * to the API as is — no need to build a "Bearer" prefix ourselves.
+	 */
+	private suspend fun authToken(forceRefresh: Boolean = false): String? {
+		if (forceRefresh || !tokenLoaded) {
+			cachedToken = localStorage("Authorization")
+			tokenLoaded = true
+		}
+		return cachedToken
+	}
+
+	private suspend fun localStorage(key: String): String? = runCatching {
+		WebViewHelper(context)
+			.getLocalStorageValue(domain, key)
+			?.trim()
+			?.removeSurrounding("\"")
+			?.trim()
+			?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
+	}.getOrNull()
+
+	private suspend fun apiHeaders(): Headers = Headers.Builder()
+		.add(CommonHeaders.REFERER, "$baseUrl/")
+		.add(CommonHeaders.X_REQUESTED_WITH, "XMLHttpRequest")
+		.apply { authToken()?.let { add(CommonHeaders.AUTHORIZATION, it) } }
+		.build()
+
+	// endregion
+
+	// region catalog
+
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = buildString {
-            append(apiUrl)
-            append("/search?p=${page - 1}")
-            if (!filter.query.isNullOrBlank()) {
-                append("&searchValue=${(filter.query.urlEncoded())}")
-            }
-
-            val sortValue = when (order) {
-                SortOrder.POPULARITY -> "viewCount"
-                SortOrder.NEWEST -> "createdAt"
-                SortOrder.RATING -> "evaluationScore"
-                else -> "recentDate" // UPDATED
-            }
-            append("&orders%5B%5D=$sortValue")
-
-            filter.tags.forEach { append("&categories%5B%5D=${it.key}") }
-
-            filter.states.forEach {
-                val statusKey = when (it) {
-                    MangaState.ONGOING -> "PRG"
-                    MangaState.FINISHED -> "END"
-                    else -> null
-                }
-                if (statusKey != null) append("&status%5B%5D=$statusKey")
-            }
-        }
-
-        val json = webClient.httpGet(url, extraHeaders = apiHeaders()).parseJson()
-        val result = json.optJSONObject("result") ?: return emptyList()
-        val data = result.optJSONArray("data") ?: return emptyList()
-
-        return List(data.length()) { i ->
-            val item = data.getJSONObject(i)
-            val comicId = item.getString("id")
-            val slug = item.getString("nameEn")
-            val mangaUrl = "/truyen/$slug"
-            val tags = item.optJSONArray("category")?.let { arr ->
-                (0 until arr.length()).mapNotNullTo(mutableSetOf()) { index ->
-                    val tagName = arr.getString(index)
-                    availableTags().find { it.title.equals(tagName, ignoreCase = true) }?.let { genrePair ->
-                        MangaTag(key = genrePair.key, title = genrePair.title, source = source)
-                    }
-                }
-            } ?: emptySet()
-
-            Manga(
-                id = generateUid(comicId),
-                title = item.getString("name"),
-                altTitles = item.optString("otherName", "").split(",").mapNotNull { it.trim().takeIf(String::isNotBlank) }.toSet(),
-                url = "$comicId:$slug", // Store both id and slug, separated by ':'
-                publicUrl = "https://$domain$mangaUrl",
-                rating = item.optDouble("evaluationScore", 0.0).toFloat(),
-                contentRating = null,
-                coverUrl = "https://$domain${item.getString("photo")}",
-                tags = tags,
-                state = when (item.optString("statusCode")) {
-                    "PRG" -> MangaState.ONGOING
-                    "END" -> MangaState.FINISHED
-                    else -> null
-                },
-                authors = setOf(item.optString("author", "Updating")),
-                source = source
-            )
-        }
-    }
-
-    override suspend fun getDetails(manga: Manga): Manga {
-        val comicId = manga.url.substringBefore(':')
-        val slug = manga.url.substringAfter(':')
-
-        val chapters = try {
-            val chapterApiUrl = "https://$domain/api/comic/$comicId/chapter?limit=-1"
-
-			// Auth before send request for chapters
-			if (userToken.isBlank()) {
-				throw AuthRequiredException(
-					source,
-					IllegalStateException("No username found, please login")
-				)
+		val url = apiUrl("search").newBuilder().apply {
+			addQueryParameter("p", (page - 1).coerceAtLeast(0).toString())
+			filter.query
+				?.takeIf { it.isNotBlank() }
+				?.let { addQueryParameter("searchValue", it) }
+			addQueryParameter("orders[]", order.toApiSort())
+			filter.tags.forEach { addQueryParameter("categories[]", it.key) }
+			filter.states.forEach { state ->
+				state.toApiStatus()?.let { addQueryParameter("status[]", it) }
 			}
+		}.build()
 
-            val chapterJson = webClient.httpGet(chapterApiUrl, extraHeaders = apiHeaders()).parseJson()
-            val chaptersData = chapterJson.getJSONObject("result").getJSONArray("chapters")
+		val data = webClient.httpGet(url, apiHeaders())
+			.parseJson()
+			.optJSONObject("result")
+			?.optJSONArray("data")
+			?: return emptyList()
 
-            List(chaptersData.length()) { i ->
-                val item = chaptersData.getJSONObject(i)
-                val number = item.getString("numberChapter")
-                val name = item.getString("name")
-                val chapterUrl = "/truyen/$slug/chuong-$number" // keep for generateUid
-                MangaChapter(
-                    id = generateUid(chapterUrl),
-                    title = if (name != "N/A" && name.isNotBlank()) name else "Chapter $number",
-                    number = number.toFloatOrNull() ?: -1f,
-                    volume = 0,
-                    url = "$comicId:$number/$slug",
-                    scanlator = null,
-                    uploadDate = item.optLong("updateTime", 0L),
-                    branch = null,
-                    source = source
-                )
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }.reversed()
+		return (0 until data.length()).mapNotNull { index ->
+			data.optJSONObject(index)?.toManga()
+		}
+	}
 
-        val doc = webClient.httpGet(manga.publicUrl).parseHtml()
-        val detailTags = doc.select(".group-content > .v-chip-link").mapNotNullTo(mutableSetOf()) { el ->
-            availableTags().find { it.title.equals(el.text(), ignoreCase = true) }?.let {
-                MangaTag(key = it.key, title = it.title, source = source)
-            }
-        }
+	private fun JSONObject.toManga(): Manga? {
+		val comicId = optString("id").takeIf { it.isNotBlank() } ?: return null
+		val slug = optString("nameEn").takeIf { it.isNotBlank() } ?: return null
 
-        return manga.copy(
-            title = doc.selectFirst(".v-card-title")?.text().orEmpty(),
-            tags = manga.tags + detailTags,
-            coverUrl = doc.selectFirst("img.image")?.absUrl("src"),
-            state = when (doc.selectFirst(".mb-1:contains(Trạng thái:) span")?.text()) {
-                "Đang thực hiện" -> MangaState.ONGOING
-                "Hoàn thành" -> MangaState.FINISHED
-                else -> manga.state
-            },
-            authors = setOfNotNull(doc.selectFirst(".mb-1:contains(Tác giả:) span")?.text()),
-            description = doc.selectFirst(".v-card-text")?.text(),
-            chapters = chapters
-        )
-    }
+		val codes = optJSONArray("categoryCode")
+		val names = optJSONArray("category")
+		val tags = (0 until (codes?.length() ?: 0)).mapNotNullTo(mutableSetOf()) { index ->
+			tagOf(codes?.optString(index).orEmpty(), names?.optString(index).orEmpty())
+		}
 
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = "https://$domain/truyen/" +
-			chapter.url.substringAfter("/") + "/" +
-			chapter.url.substringAfter(":").substringBefore("/")
-		if (userToken.isBlank()) throw AuthRequiredException(source,
-			IllegalStateException("Token not found, please login"))
-		else userToken = loadAuthToken(fullUrl)
+		return Manga(
+			id = generateUid(comicId),
+			title = optString("name"),
+			altTitles = optString("otherName")
+				.split(',')
+				.mapNotNull { it.trim().takeIf(String::isNotBlank) }
+				.toSet(),
+			url = "$comicId:$slug",
+			publicUrl = "$baseUrl/truyen/$slug",
+			rating = optDouble("evaluationScore", 0.0).toFloat().let {
+				if (it > 0f) (it / 5f).coerceIn(0f, 1f) else RATING_UNKNOWN
+			},
+			contentRating = null,
+			coverUrl = optString("photo").let { if (it.startsWith("http")) it else "$baseUrl$it" },
+			tags = tags,
+			state = optString("statusCode").toMangaState(),
+			authors = setOfNotNull(optString("author").takeIf { it.isNotBlank() }),
+			description = optString("description").takeIf { it.isNotBlank() },
+			source = source,
+		)
+	}
 
-		val payload =
-			"comicId=${chapter.url.substringBefore(":")}" +
-				"&chapterNumber=${chapter.url.substringAfter(":").substringBefore("/")}" +
-				"&nameEn=${chapter.url.substringAfter("/")}"
+	// endregion
 
-		val res = webClient.httpPost(
-			"https://$domain/api/chapter/loadAll".toHttpUrl(),
-			payload,
-			apiHeaders()
-		).parseJson()
+	override suspend fun getDetails(manga: Manga): Manga {
+		val pageUrl = mangaPageUrl(manga)
+		val doc = webClient.httpGet(pageUrl).parseHtml()
 
-		val data = res.getJSONObject("result").getJSONArray("data")
+		val script = doc.select("script")
+			.firstOrNull { it.data().contains("const comic =") }
+			?.data()
 
-		return data.asTypedList<String>().map {
-			MangaPage(
-				id = generateUid(it),
-				url = it,
-				preview = null,
+		val slug = script
+			?.let { COMIC_NAME_REGEX.find(it)?.groupValues?.get(1) }
+			?: mangaSlug(manga)
+			?: throw IllegalStateException("Không tìm thấy tên truyện trong $pageUrl")
+
+		val comicId = script
+			?.let { COMIC_ID_REGEX.find(it)?.groupValues?.get(1) }
+			?: doc.selectFirst("#comic-id-comment")?.attr("value")?.takeIf { it.isNotBlank() }
+			?: mangaComicId(manga)
+			?: comicIdFromPage(slug)
+			?: throw IllegalStateException("Không tìm thấy mã truyện trong $pageUrl")
+
+		return manga.copy(
+			title = doc.selectFirst(".v-card-title")?.textOrNull() ?: manga.title,
+			coverUrl = doc.selectFirst("img.image")?.absUrl("src") ?: manga.coverUrl,
+			tags = manga.tags + doc.select(".group-content > .v-chip-link").mapNotNull { tagByName(it.text()) },
+			state = doc.selectFirst(".mb-1:contains(Trạng thái:) span")?.textOrNull()?.toMangaState() ?: manga.state,
+			authors = setOfNotNull(doc.selectFirst(".mb-1:contains(Tác giả:) span")?.textOrNull()),
+			description = doc.selectFirst(".v-card-text")?.textOrNull() ?: manga.description,
+			chapters = loadChapters(comicId, slug),
+		)
+	}
+
+	private suspend fun loadChapters(comicId: String, slug: String): List<MangaChapter> {
+		if (authToken() == null) {
+			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
+		}
+
+		val json = webClient
+			.httpGet("$baseUrl/api/comic/$comicId/chapter?limit=-1", apiHeaders())
+			.parseJson()
+
+		val result = json.optJSONObject("result")
+			?: throw AuthRequiredException(source, IllegalStateException(json.errorMessage()))
+		val chapters = result.optJSONArray("chapters") ?: return emptyList()
+
+		// the api returns chapters from the newest to the oldest one
+		return chapters.mapChapters(reversed = true) { _, item ->
+			val number = item.optString("numberChapter")
+			val title = item.optString("name")
+			MangaChapter(
+				id = generateUid("/truyen/$slug/chuong-$number"),
+				title = title.takeUnless { it.isBlank() || it == "N/A" } ?: "Chương $number",
+				number = number.toFloatOrNull() ?: -1f,
+				volume = 0,
+				url = "/truyen/$slug/chuong-$number#$comicId",
+				scanlator = null,
+				uploadDate = item.optLong("updateTime", 0L),
+				branch = null,
 				source = source,
 			)
 		}
 	}
 
-	private suspend fun loadAuthToken(domain: String): String {
-		return WebViewHelper(context)
-			.getLocalStorageValue(domain, "Authorization")
-			?.removeSurrounding('"')
-			?.trim()
-			?.takeIf { it.startsWith("Bearer ") }
-			.toString()
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val ref = chapterRef(chapter)
+		if (authToken() == null) {
+			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
+		}
+
+		suspend fun requestPages(): List<MangaPage>? = try {
+			val payload = buildString {
+				append("comicId=").append(ref.comicId)
+				append("&chapterNumber=").append(ref.number)
+				append("&nameEn=").append(ref.slug)
+			}
+			val result = webClient
+				.httpPost("$baseUrl/api/chapter/loadAll".toHttpUrl(), payload, apiHeaders())
+				.parseJson()
+				.optJSONObject("result")
+			val data = result?.optJSONArray("data")
+			data?.let {
+				(0 until it.length()).mapNotNull { index ->
+					val raw = it.optString(index).takeIf(String::isNotBlank) ?: return@mapNotNull null
+					val url = if (raw.startsWith("/")) "$baseUrl$raw" else raw
+					MangaPage(
+						id = generateUid(url),
+						url = url,
+						preview = null,
+						source = source,
+					)
+				}
+			}
+		} catch (_: Exception) {
+			null
+		}
+
+		var pages = requestPages()
+		if (pages == null) {
+			// the stored token may have expired — pick the fresh one up and warm up the cookies
+			authToken(forceRefresh = true)
+			runCatching { webClient.httpGet("$baseUrl/truyen/${ref.slug}") }.getOrNull()?.close()
+			pages = requestPages()
+		}
+
+		return pages
+			?: throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
 	}
 
-	private fun availableTags() = arraySetOf(
-        MangaTag("Anime", "ANI", source),
-        MangaTag("Drama", "DRA", source),
-        MangaTag("Josei", "JOS", source),
-        MangaTag("Manhwa", "MAW", source),
-        MangaTag("One Shot", "OSH", source),
-        MangaTag("Shounen", "SHO", source),
-        MangaTag("Webtoons", "WEB", source),
-        MangaTag("Shoujo", "SHJ", source),
-        MangaTag("Harem", "HAR", source),
-        MangaTag("Ecchi", "ECC", source),
-        MangaTag("Mature", "MAT", source),
-        MangaTag("Slice of life", "SOL", source),
-        MangaTag("Isekai", "ISE", source),
-        MangaTag("Manga", "MAG", source),
-        MangaTag("Manhua", "MAU", source),
-        MangaTag("Hành Động", "ACT", source),
-        MangaTag("Phiêu Lưu", "ADV", source),
-        MangaTag("Hài Hước", "COM", source),
-        MangaTag("Võ Thuật", "MAA", source),
-        MangaTag("Huyền Bí", "MYS", source),
-        MangaTag("Lãng Mạn", "ROM", source),
-        MangaTag("Thể Thao", "SPO", source),
-        MangaTag("Học Đường", "SCL", source),
-        MangaTag("Lịch Sử", "HIS", source),
-        MangaTag("Kinh Dị", "HOR", source),
-        MangaTag("Siêu Nhiên", "SUN", source),
-        MangaTag("Bi Kịch", "TRA", source),
-        MangaTag("Trùng Sinh", "RED", source),
-        MangaTag("Game", "GAM", source),
-        MangaTag("Viễn Tưởng", "FTS", source),
-        MangaTag("Khoa Học", "SCF", source),
-        MangaTag("Truyện Màu", "COI", source),
-        MangaTag("Người Lớn", "ADU", source),
-        MangaTag("BoyLove", "BBL", source),
-        MangaTag("Hầm Ngục", "DUN", source),
-        MangaTag("Săn Bắn", "HUNT", source),
-        MangaTag("Ngôn Từ Nhạy Cảm", "NTNC", source),
-        MangaTag("Doujinshi", "DOU", source),
-        MangaTag("Bạo Lực", "BLM", source),
-        MangaTag("Ngôn Tình", "NTT", source),
-        MangaTag("Nữ Cường", "NCT", source),
-        MangaTag("Gender Bender", "GDB", source),
-        MangaTag("Murim", "MRR", source),
-        MangaTag("Leo Tháp", "LTT", source),
-        MangaTag("Nấu Ăn", "COO", source)
-    )
-}
+	// region helpers
 
+	private fun apiUrl(path: String) = "$baseUrl/api/v2/$path".toHttpUrl()
+
+	private suspend fun loadCategories(): Set<MangaTag> {
+		cachedCategories?.let { return it }
+		val fetched = runCatching {
+			val array = webClient.httpGet(apiUrl("category"), apiHeaders()).parseJsonArray()
+			(0 until array.length()).mapNotNullTo(arraySetOf()) { index ->
+				val item = array.optJSONObject(index) ?: return@mapNotNullTo null
+				val code = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
+				val name = item.optString("name").takeIf { it.isNotBlank() } ?: code
+				MangaTag(title = name, key = code, source = source)
+			}
+		}.getOrNull()
+
+		val categories: Set<MangaTag> = fetched?.takeIf { it.isNotEmpty() } ?: FALLBACK_TAGS
+		cachedCategories = categories
+		return categories
+	}
+
+	private fun JSONObject.errorMessage(): String = optJSONArray("messages")
+		?.let { messages -> (0 until messages.length()).map { messages.optString(it) }.firstOrNull { it.isNotBlank() } }
+		?: AUTH_MESSAGE
+
+	private fun tagOf(code: String, name: String): MangaTag? {
+		if (code.isBlank()) {
+			return tagByName(name)
+		}
+		val title = FALLBACK_TAGS.firstOrNull { it.key == code }?.title ?: name.takeIf { it.isNotBlank() } ?: code
+		return MangaTag(key = code, title = title, source = source)
+	}
+
+	private fun tagByName(name: String): MangaTag? {
+		val title = name.trim().takeIf { it.isNotEmpty() } ?: return null
+		val known = FALLBACK_TAGS.firstOrNull { it.title.equals(title, ignoreCase = true) }
+		return known?.copy(source = source) ?: MangaTag(key = title, title = title, source = source)
+	}
+
+	private fun SortOrder.toApiSort(): String = when (this) {
+		SortOrder.POPULARITY -> "viewCount"
+		SortOrder.RATING -> "evaluationScore"
+		SortOrder.NEWEST -> "createdAt"
+		else -> "recentDate"
+	}
+
+	private fun MangaState.toApiStatus(): String? = when (this) {
+		MangaState.ONGOING -> "PRG"
+		MangaState.FINISHED -> "END"
+		else -> null
+	}
+
+	private fun String.toMangaState(): MangaState? = when (this) {
+		"PRG", "Đang thực hiện" -> MangaState.ONGOING
+		"END", "Hoàn thành" -> MangaState.FINISHED
+		else -> null
+	}
+
+	/**
+	 * The manga may come either from the list ("<comicId>:<slug>") or from a link
+	 * (a relative url like "/truyen/<slug>")
+	 */
+	private fun mangaSlug(manga: Manga): String? = manga.url
+		.substringAfter(':')
+		.substringAfter("/truyen/")
+		.substringBefore('/')
+		.takeIf { it.isNotBlank() }
+
+	private fun mangaComicId(manga: Manga): String? = manga.url
+		.substringBefore(':')
+		.takeIf { it.isNotBlank() && !it.contains('/') }
+
+	private fun mangaPageUrl(manga: Manga): String = "$baseUrl/truyen/${mangaSlug(manga) ?: manga.url}"
+
+	private suspend fun comicIdFromPage(slug: String): String? = runCatching {
+		webClient.httpGet("$baseUrl/truyen/$slug").parseHtml()
+			.selectFirst("#comic-id-comment")
+			?.attr("value")
+			?.takeIf { it.isNotBlank() }
+	}.getOrNull()
+
+	/**
+	 * Supports both the current chapter url ("/truyen/<slug>/chuong-<number>#<comicId>")
+	 * and the legacy one ("<comicId>:<number>/<slug>") that may still be stored in the database
+	 */
+	private suspend fun chapterRef(chapter: MangaChapter): ChapterRef {
+		val url = chapter.url
+		if (url.contains(CHAPTER_SEPARATOR)) {
+			val slug = url.substringAfter("/truyen/").substringBefore(CHAPTER_SEPARATOR)
+			val number = url.substringAfter(CHAPTER_SEPARATOR).substringBefore('#').substringBefore('/')
+			if (slug.isNotBlank() && number.isNotBlank()) {
+				val comicId = url.substringAfter('#', "")
+					.takeIf { it.isNotBlank() }
+					?: comicIdFromPage(slug)
+				if (comicId != null) {
+					return ChapterRef(comicId, slug, number)
+				}
+			}
+		}
+
+		val comicId = url.substringBefore(':')
+		val rest = url.substringAfter(':', "")
+		val number = rest.substringBefore('/')
+		val slug = rest.substringAfter('/', "")
+		if (comicId.isNotBlank() && number.isNotBlank() && slug.isNotBlank()) {
+			return ChapterRef(comicId, slug, number)
+		}
+
+		throw IllegalStateException("Không đọc được thông tin chương: $url")
+	}
+
+	// endregion
+
+	private data class ChapterRef(
+		val comicId: String,
+		val slug: String,
+		val number: String,
+	)
+
+	private companion object {
+
+		/**
+		 * Fallback for the `/api/v2/category` endpoint, kept in sync with the site
+		 */
+		private val FALLBACK_TAGS = arraySetOf(
+			MangaTag("Anime", "ANI", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Drama", "DRA", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Josei", "JOS", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Manhwa", "MAW", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("One Shot", "OSH", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Shounen", "SHO", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Webtoons", "WEB", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Shoujo", "SHJ", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Harem", "HAR", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Ecchi", "ECC", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Mature", "MAT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Slice of life", "SOL", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Isekai", "ISE", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Manga", "MAG", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Manhua", "MAU", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Hành Động", "ACT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Phiêu Lưu", "ADV", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Hài Hước", "COM", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Võ Thuật", "MAA", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Huyền Bí", "MYS", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Lãng Mạn", "ROM", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Thể Thao", "SPO", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Học Đường", "SCL", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Lịch Sử", "HIS", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Kinh Dị", "HOR", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Siêu Nhiên", "SUN", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Bi Kịch", "TRA", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Trùng Sinh", "RED", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Game", "GAM", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Viễn Tưởng", "FTS", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Khoa Học", "SCF", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Truyện Màu", "COI", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Người Lớn", "ADU", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("BoyLove", "BBL", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Hầm Ngục", "DUN", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Săn Bắn", "HUNT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Ngôn Từ Nhạy Cảm", "NTNC", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Doujinshi", "DOU", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Bạo Lực", "BLM", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Ngôn Tình", "NTT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Nữ Cường", "NCT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Gender Bender", "GDB", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Murim", "MRR", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Leo Tháp", "LTT", MangaParserSource.GOCTRUYENTRANHVUI),
+			MangaTag("Nấu Ăn", "COO", MangaParserSource.GOCTRUYENTRANHVUI),
+		)
+	}
+}
