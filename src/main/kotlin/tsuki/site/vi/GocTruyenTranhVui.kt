@@ -27,6 +27,7 @@ private const val DEBUG_LOG = true
 private const val LOG_TAG = "[GocTruyenTranhVui]"
 private const val AUTHORIZATION_KEY = "Authorization"
 private const val USER_INFO_KEY = "user_info"
+private const val GOOGLE_CLIENT_ID = "957735517445-b33dahmc67lr938l52j82v82oetd3o94.apps.googleusercontent.com"
 
 private val COMIC_ID_REGEX = Regex("""id:\s*"([^"]+)"""")
 private val COMIC_NAME_REGEX = Regex("""nameEn:\s*`([^`]+)`""")
@@ -91,6 +92,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	}
 
 	private var cachedToken: String? = null
+	private var loginUrl: String? = null
 	private var cachedCategories: Set<MangaTag>? = null
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -111,17 +113,59 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		isSearchWithFiltersSupported = true,
 	)
 
-	override suspend fun getFilterOptions() = MangaListFilterOptions(
+	override suspend fun getFilterOptions(): MangaListFilterOptions {
+		refreshLoginUrl()
+		return filterOptions()
+	}
+
+	private suspend fun filterOptions() = MangaListFilterOptions(
 		availableTags = loadCategories(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
 	)
 
 	// region authorization
 
+	/**
+	 * The site's own sign in button only posts to `/api/login/google` and then navigates
+	 * to the url that call returns — but that page is a heavy Vue app, so in an embedded
+	 * WebView the tap usually lands before the handler is bound and nothing happens.
+	 * Going straight to the provider does the same thing without the middleman: google
+	 * sends the user back to `$baseUrl/login?code=...`, which is the page that really
+	 * writes the token into the local storage.
+	 */
 	override val authUrl: String
-		get() = "$baseUrl/"
+		get() = loginUrl ?: defaultLoginUrl()
+
+	private fun defaultLoginUrl(): String = buildString {
+		append("https://accounts.google.com/o/oauth2/v2/auth")
+		append("?scope=profile")
+		append("&access_type=offline")
+		append("&include_granted_scopes=true")
+		append("&response_type=code")
+		append("&state=GA")
+		append("&client_id=").append(GOOGLE_CLIENT_ID)
+		append("&redirect_uri=").append("$baseUrl/login")
+	}
+
+	/** Follows the site if it ever changes the oauth client; the default above is a fallback. */
+	private suspend fun refreshLoginUrl() {
+		if (loginUrl != null) {
+			return
+		}
+		val url = runCatching {
+			webClient
+				.httpPost("$baseUrl/api/login/google".toHttpUrl(), "type=GA", apiHeaders())
+				.parseJson()
+				.optString("result")
+		}.getOrNull()
+		if (url != null && url.startsWith("https://")) {
+			loginUrl = url
+			log("login url: $url")
+		}
+	}
 
 	override suspend fun isAuthorized(): Boolean {
+		refreshLoginUrl()
 		val token = readToken()
 		log("isAuthorized: domain=$domain token=${token.describeToken()}")
 		if (token == null) {
