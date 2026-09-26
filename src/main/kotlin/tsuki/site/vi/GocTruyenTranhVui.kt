@@ -78,7 +78,9 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 */
 	private fun log(message: String) {
 		if (DEBUG_LOG) {
+			// both streams land in logcat ("System.out" / "System.err"), no android APIs needed
 			println("$LOG_TAG $message")
+			System.err.println("$LOG_TAG $message")
 		}
 	}
 
