@@ -56,6 +56,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
+			.callTimeout(20.seconds)
 			.rateLimit(30, 1.seconds)
 			.build(),
 		source,
@@ -79,9 +80,8 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 */
 	private fun log(message: String) {
 		if (DEBUG_LOG) {
-			// both streams land in logcat ("System.out" / "System.err"), no android APIs needed
+			// stdout lands in logcat as "System.out"
 			println("$LOG_TAG $message")
-			System.err.println("$LOG_TAG $message")
 		}
 	}
 
@@ -92,7 +92,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	}
 
 	private var cachedToken: String? = null
-	private var loginUrl: String? = null
+	private var cachedUsername: String? = null
 	private var cachedCategories: Set<MangaTag>? = null
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -113,12 +113,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		isSearchWithFiltersSupported = true,
 	)
 
-	override suspend fun getFilterOptions(): MangaListFilterOptions {
-		refreshLoginUrl()
-		return filterOptions()
-	}
-
-	private suspend fun filterOptions() = MangaListFilterOptions(
+	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = loadCategories(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
 	)
@@ -132,9 +127,12 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 * Going straight to the provider does the same thing without the middleman: google
 	 * sends the user back to `$baseUrl/login?code=...`, which is the page that really
 	 * writes the token into the local storage.
+	 *
+	 * The url is built locally (no request on the sign in path): it is what
+	 * `POST /api/login/google` has been answering, client id included.
 	 */
 	override val authUrl: String
-		get() = loginUrl ?: defaultLoginUrl()
+		get() = defaultLoginUrl()
 
 	private fun defaultLoginUrl(): String = buildString {
 		append("https://accounts.google.com/o/oauth2/v2/auth")
@@ -147,26 +145,10 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		append("&redirect_uri=").append("$baseUrl/login")
 	}
 
-	/** Follows the site if it ever changes the oauth client; the default above is a fallback. */
-	private suspend fun refreshLoginUrl() {
-		if (loginUrl != null) {
-			return
-		}
-		val url = runCatching {
-			webClient
-				.httpPost("$baseUrl/api/login/google".toHttpUrl(), "type=GA", apiHeaders())
-				.parseJson()
-				.optString("result")
-		}.getOrNull()
-		if (url != null && url.startsWith("https://")) {
-			loginUrl = url
-			log("login url: $url")
-		}
-	}
-
 	override suspend fun isAuthorized(): Boolean {
-		refreshLoginUrl()
-		val token = readToken()
+		// currentToken() only touches the WebView again while there is no token, so a signed
+		// in user does not pay for a round trip on every check
+		val token = currentToken()
 		log("isAuthorized: domain=$domain token=${token.describeToken()}")
 		if (token == null) {
 			return false
@@ -176,12 +158,14 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	}
 
 	override suspend fun getUsername(): String {
+		cachedUsername?.let { return it }
 		val name = localStorage(USER_INFO_KEY)?.let { raw ->
 			runCatching { JSONObject(raw).optString("name") }.getOrNull()
 		}
 		if (name.isNullOrBlank()) {
 			throw AuthRequiredException(source, IllegalStateException(AUTH_MESSAGE))
 		}
+		cachedUsername = name
 		return name
 	}
 
@@ -189,9 +173,9 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 * The site stores the ready-to-use header value in the local storage, so it is passed
 	 * to the API as is — there is no need to build a "Bearer" prefix ourselves.
 	 *
-	 * The value is re-read on every check instead of being cached forever: the site
-	 * rewrites it on sign in/out and the user signs in *after* the first check, so a
-	 * cached "no token" would hide the account for the rest of the session.
+	 * The value is re-read from the WebView only while it is missing: the site rewrites it
+	 * on sign in/out and the user signs in *after* the first check, so a cached "no token"
+	 * would hide the account for the rest of the session.
 	 */
 	private suspend fun readToken(): String? = localStorage(AUTHORIZATION_KEY)
 		.also { cachedToken = it }
@@ -296,6 +280,18 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	// endregion
 
 	override suspend fun getDetails(manga: Manga): Manga {
+		val listingId = mangaComicId(manga)
+		val listingSlug = mangaSlug(manga)
+
+		// The listing api already carries the title, cover, description, tags and status,
+		// while the details page is ~140 KB of html with ads on top of it. Only read it
+		// when something is actually missing (a manga opened by link, for example), so
+		// opening a manga from the list costs a single request.
+		if (listingId != null && listingSlug != null && manga.coverUrl != null && manga.description != null) {
+			log("details: $listingId:$listingSlug from the listing, page skipped")
+			return manga.copy(chapters = loadChapters(listingId, listingSlug))
+		}
+
 		val pageUrl = mangaPageUrl(manga)
 		val doc = webClient.httpGet(pageUrl).parseHtml()
 
