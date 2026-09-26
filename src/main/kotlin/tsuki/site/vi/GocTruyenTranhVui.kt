@@ -23,6 +23,8 @@ private const val PAGE_SIZE = 30
 private const val CHAPTER_SEPARATOR = "/chuong-"
 private const val AUTH_MESSAGE = "Phiên làm việc đã hết hạn, vui lòng đăng nhập lại"
 private const val BEARER_PREFIX = "Bearer "
+private const val DEBUG_LOG = true
+private const val LOG_TAG = "[GocTruyenTranhVui]"
 private const val AUTHORIZATION_KEY = "Authorization"
 private const val USER_INFO_KEY = "user_info"
 
@@ -69,6 +71,23 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 
 	private val baseUrl: String get() = "https://$domain"
 
+	/**
+	 * Diagnostics for the report "the sign in row stays grey": the app swallows parser
+	 * exceptions and logs nothing by itself, so every step that depends on the token is
+	 * printed to logcat (tag `System.out`) while [DEBUG_LOG] is on.
+	 */
+	private fun log(message: String) {
+		if (DEBUG_LOG) {
+			println("$LOG_TAG $message")
+		}
+	}
+
+	private fun String?.describeToken(): String = when {
+		this == null -> "none"
+		isExpiredJwt() -> "expired(${length} chars)"
+		else -> "${length} chars"
+	}
+
 	private var cachedToken: String? = null
 	private var cachedCategories: Set<MangaTag>? = null
 
@@ -101,7 +120,11 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		get() = "$baseUrl/"
 
 	override suspend fun isAuthorized(): Boolean {
-		val token = readToken() ?: return false
+		val token = readToken()
+		log("isAuthorized: domain=$domain token=${token.describeToken()}")
+		if (token == null) {
+			return false
+		}
 		// an expired token must not keep the "sign in" row of the app disabled forever
 		return !token.isExpiredJwt()
 	}
@@ -185,9 +208,11 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 			?.optJSONArray("data")
 			?: return emptyList()
 
-		return (0 until data.length()).mapNotNull { index ->
+		val items = (0 until data.length()).mapNotNull { index ->
 			data.optJSONObject(index)?.toManga()
 		}
+		log("list: page=$page order=$order query=${filter.query} tags=${filter.tags.map { it.key }} -> ${items.size} items")
+		return items
 	}
 
 	private fun JSONObject.toManga(): Manga? {
@@ -296,10 +321,12 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		}
 
 		var chapters = requestChapters()
+		log("chapters: id=$comicId slug=$slug token=${currentToken().describeToken()} -> ${chapters?.size ?: "failed($error)"}")
 		if (chapters == null) {
 			// the session may have expired — the user could have signed in again in the WebView
 			currentToken(forceRefresh = true)
 			chapters = requestChapters()
+			log("chapters: retry with token=${currentToken().describeToken()} -> ${chapters?.size ?: "failed($error)"}")
 		}
 
 		return chapters
@@ -342,11 +369,13 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		}
 
 		var pages = requestPages()
+		log("pages: $ref token=${currentToken().describeToken()} -> ${pages?.size ?: "failed"}")
 		if (pages == null) {
 			// the stored token may have expired — pick the fresh one up and warm up the cookies
 			currentToken(forceRefresh = true)
 			runCatching { webClient.httpGet("$baseUrl/truyen/${ref.slug}") }.getOrNull()?.close()
 			pages = requestPages()
+			log("pages: retry with token=${currentToken().describeToken()} -> ${pages?.size ?: "failed"}")
 		}
 
 		return pages
@@ -370,6 +399,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		}.getOrNull()
 
 		val categories: Set<MangaTag> = fetched?.takeIf { it.isNotEmpty() } ?: FALLBACK_TAGS
+		log("categories: ${categories.size} (fetched=${fetched != null})")
 		cachedCategories = categories
 		return categories
 	}
@@ -470,7 +500,9 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 		val comicId: String,
 		val slug: String,
 		val number: String,
-	)
+	) {
+		override fun toString(): String = "comic=$comicId slug=$slug number=$number"
+	}
 
 	private companion object {
 
