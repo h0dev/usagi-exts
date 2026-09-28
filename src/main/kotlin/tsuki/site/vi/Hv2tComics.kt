@@ -117,7 +117,23 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      * The cookies/state are then read back via `context.evaluateJs` in
      * [isAuthorized] / [readDecryptedChapter].
      */
-    override val authUrl: String get() = "$baseUrl/"
+    /**
+     * `authUrl` is what the app's SourceAuthActivity opens. We point
+     * it straight at the sign-in page so that after the user clears
+     * the age-gate, they land on a screen with a clear
+     * "Đăng nhập với Discord" button. The user can then either:
+     *
+     *  - tap the Discord button to log in (full access), or
+     *  - hit Back / the up arrow to dismiss the activity, in which
+     *    case [isAuthorized] still returns `false` (no session) so
+     *    the app keeps the "Đăng nhập" row enabled and the user can
+     *    browse the catalog (list / search / details) without ever
+     *    creating an account. Free and VIP chapters will then 401 in
+     *    [getPages] and the app's exception resolver opens this
+     *    same activity again, so the user can log in later from
+     *    there.
+     */
+    override val authUrl: String get() = "$baseUrl/auth/login"
 
     /**
      * Both halves have to be true before the app will let the user back
