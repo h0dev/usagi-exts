@@ -203,10 +203,14 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     override suspend fun isAuthorized(): Boolean {
         val cached = cachedAuthCheck
         if (cached != null && System.currentTimeMillis() - cached.first < authCacheTtlMs) {
+            log("isAuthorized: cache hit -> ${cached.second} (age ${System.currentTimeMillis() - cached.first}ms)")
             return cached.second
         }
-        val result = ensureAgeGateCookie() && checkSessionCookie()
+        val ageGate = ensureAgeGateCookie()
+        val session = checkSessionCookie()
+        val result = ageGate && session
         cachedAuthCheck = System.currentTimeMillis() to result
+        log("isAuthorized: cache miss -> $result (age-gate=$ageGate, session=$session)")
         return result
     }
 
@@ -250,37 +254,31 @@ internal class Hv2tComics(context: MangaLoaderContext) :
 
     private suspend fun readDocumentCookie(): String? = runCatching {
         context.evaluateJs("$baseUrl/", "document.cookie")
-    }.getOrNull()
+    }.onSuccess { log("readDocumentCookie: ${it?.take(80)}") }.getOrNull()
 
     /**
      * Hits the SPA's own session probe (`/api/users/me`) from inside the
-     * WebView. Routed through the *deprecated* `evaluateJs(script)`
-     * overload (no base URL) — see [isAuthorized] for why this matters:
-     * it lets the user keep interacting with the page for a few
-     * hundred ms before `WebViewExecutor.reset()` blanks it.
+     * WebView so the request picks up the session cookie that the
+     * Discord OAuth flow drops into the WebView's CookieManager. We
+     * cannot make this call through `webClient` because the OkHttp
+     * cookie jar only sees the age-gate cookie we injected above.
      *
-     * The script is wrapped in `try/catch` because once the user has
-     * navigated into the Discord OAuth flow the WebView is on
-     * `discord.com`, where the relative `fetch('/api/users/me')` would
-     * either hit a CORS wall or a 404. We map anything that isn't a
-     * clean `200` to "not logged in" so the activity keeps the user
-     * in the flow until they actually complete it.
+     * `evaluateJs(baseUrl, script)` sets the origin to the site's
+     * base URL and runs the script in a stub document. The
+     * `loadDataWithBaseURL` call also gives the WebView a moment on
+     * an empty `hv2tcomics.net` document — which is **lighter** than
+     * the live Cloudflare / Discord OAuth page the user has been
+     * staring at, so the heap doesn't keep climbing while the
+     * 30-second cache window is in effect.
      */
     private suspend fun checkSessionCookie(): Boolean {
-        val script = """
-            (async () => {
-                try {
-                    if (location.hostname && !location.hostname.endsWith('hv2tcomics.net')) {
-                        return 'wrong-host';
-                    }
-                    const resp = await fetch('/api/users/me', { credentials: 'include' });
-                    return String(resp.status);
-                } catch (e) {
-                    return '0';
-                }
-            })()
-        """.trimIndent()
-        val raw = runCatching { context.evaluateJs(script) }.getOrNull() ?: return false
+        val raw = runCatching {
+            context.evaluateJs(
+                "$baseUrl/",
+                "fetch('/api/users/me', { credentials: 'include' })" +
+                    ".then(r => r.status).catch(e => 0)",
+            )
+        }.getOrNull() ?: return false
         return raw.trim() == "200"
     }
 
