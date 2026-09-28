@@ -119,7 +119,27 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      */
     override val authUrl: String get() = "$baseUrl/"
 
-    override suspend fun isAuthorized(): Boolean = ensureAgeGateCookie()
+    /**
+     * Both halves have to be true before the app will let the user back
+     * out of the auth WebView:
+     *
+     *  1. [ensureAgeGateCookie] — the Cloudflare Worker only forwards
+     *     catalog requests when the `hv2t_adult_gate` cookie is present.
+     *     It is set when the user clicks the age-gate "Tôi đã đủ 18
+     *     tuổi" button on the homepage.
+     *  2. [checkSessionCookie] — chapter pages need a real signed-in
+     *     session (Discord OAuth); the catalog APIs work without it but
+     *     `getPages` would 401. We ask the WebView to hit
+     *     `/api/users/me` (the same call the SPA's AuthProvider makes);
+     *     a 200 means the cookie jar carries a valid session.
+     *
+     * If we returned `true` as soon as the age-gate cookie landed, the
+     * SourceAuthActivity would `finish()` immediately and the user
+     * could never reach the "Đăng nhập với Discord" button. By gating
+     * on the session as well, the activity stays open through the
+     * full two-step flow.
+     */
+    override suspend fun isAuthorized(): Boolean = ensureAgeGateCookie() && checkSessionCookie()
 
     override suspend fun getUsername(): String? = null
 
@@ -147,6 +167,28 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     private suspend fun readDocumentCookie(): String? = runCatching {
         context.evaluateJs("$baseUrl/", "document.cookie")
     }.getOrNull()
+
+    /**
+     * Hits the SPA's own session probe (`/api/users/me`) from inside the
+     * WebView so the request picks up the session cookie that the
+     * Discord OAuth flow drops into the WebView's CookieManager. We
+     * cannot make this call through `webClient` because the OkHttp
+     * cookie jar only sees the age-gate cookie we injected above.
+     *
+     * `evaluateJs` only sets the origin and runs the script in a stub
+     * document, but `fetch` from that origin still uses the CookieManager
+     * for credentials — exactly what we want here.
+     */
+    private suspend fun checkSessionCookie(): Boolean {
+        val raw = runCatching {
+            context.evaluateJs(
+                "$baseUrl/",
+                "fetch('/api/users/me', { credentials: 'include' })" +
+                    ".then(r => r.status).catch(e => 0)",
+            )
+        }.getOrNull() ?: return false
+        return raw.trim() == "200"
+    }
 
     // endregion
 
