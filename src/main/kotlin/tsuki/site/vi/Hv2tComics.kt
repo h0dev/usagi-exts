@@ -71,17 +71,30 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     )
 
     /**
+     * Enable `println` tracing for the auth flow. Tags every line
+     * with `[Hv2tComics]` so it stands out in `adb logcat` (where
+     * the app's `System.out` lands as the `System.out` tag). Turn
+     * off if the log gets noisy in normal use.
+     */
+    private val debugLog = true
+    private val logTag = "[Hv2tComics]"
+    private fun log(message: String) {
+        if (debugLog) println("$logTag $message")
+    }
+
+    /**
      * How long the answer to [isAuthorized] stays cached. The
      * SourceAuthActivity re-asks on every `onPageFinished` —
      * including the multiple intermediate hops of a Discord OAuth
      * flow — and each answer that falls through the cache triggers
      * a full [evaluateJs] round-trip (which on the shipped
      * `WebViewExecutor` replaces the WebView content and allocates
-     * a fresh empty page). 10 s is short enough to keep the source
-     * settings UI feeling current, and long enough that a typical
-     * OAuth round-trip (5–20 s) only hits the slow path once.
+     * a fresh empty page). 30 s is long enough to cover a typical
+     * Discord OAuth round-trip and short enough that the source
+     * settings UI doesn't feel stale for long after the user logs
+     * in.
      */
-    private val authCacheTtlMs = 10_000L
+    private val authCacheTtlMs = 30_000L
 
     @Volatile
     private var cachedAuthCheck: Pair<Long, Boolean>? = null
@@ -227,7 +240,7 @@ internal class Hv2tComics(context: MangaLoaderContext) :
 
     /**
      * Drops the cached [isAuthorized] answer. Production code does
-     * not need this — the 10 s TTL in [authCacheTtlMs] handles
+     * not need this — the 30 s TTL in [authCacheTtlMs] handles
      * staleness — but tests can call it between scenarios so they
      * can drive the auth flow without having to sleep past the TTL.
      */
@@ -241,23 +254,33 @@ internal class Hv2tComics(context: MangaLoaderContext) :
 
     /**
      * Hits the SPA's own session probe (`/api/users/me`) from inside the
-     * WebView so the request picks up the session cookie that the
-     * Discord OAuth flow drops into the WebView's CookieManager. We
-     * cannot make this call through `webClient` because the OkHttp
-     * cookie jar only sees the age-gate cookie we injected above.
+     * WebView. Routed through the *deprecated* `evaluateJs(script)`
+     * overload (no base URL) — see [isAuthorized] for why this matters:
+     * it lets the user keep interacting with the page for a few
+     * hundred ms before `WebViewExecutor.reset()` blanks it.
      *
-     * `evaluateJs` only sets the origin and runs the script in a stub
-     * document, but `fetch` from that origin still uses the CookieManager
-     * for credentials — exactly what we want here.
+     * The script is wrapped in `try/catch` because once the user has
+     * navigated into the Discord OAuth flow the WebView is on
+     * `discord.com`, where the relative `fetch('/api/users/me')` would
+     * either hit a CORS wall or a 404. We map anything that isn't a
+     * clean `200` to "not logged in" so the activity keeps the user
+     * in the flow until they actually complete it.
      */
     private suspend fun checkSessionCookie(): Boolean {
-        val raw = runCatching {
-            context.evaluateJs(
-                "$baseUrl/",
-                "fetch('/api/users/me', { credentials: 'include' })" +
-                    ".then(r => r.status).catch(e => 0)",
-            )
-        }.getOrNull() ?: return false
+        val script = """
+            (async () => {
+                try {
+                    if (location.hostname && !location.hostname.endsWith('hv2tcomics.net')) {
+                        return 'wrong-host';
+                    }
+                    const resp = await fetch('/api/users/me', { credentials: 'include' });
+                    return String(resp.status);
+                } catch (e) {
+                    return '0';
+                }
+            })()
+        """.trimIndent()
+        val raw = runCatching { context.evaluateJs(script) }.getOrNull() ?: return false
         return raw.trim() == "200"
     }
 
@@ -378,7 +401,7 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         // succeeded, which only happens with a valid session cookie in
         // the WebView. Promote the cached answer to `true` so the
         // source-settings row flips from "Đăng nhập" to its signed-in
-        // state immediately, even if the 10 s [authCacheTtlMs] window
+        // state immediately, even if the 30 s [authCacheTtlMs] window
         // hasn't expired yet.
         cachedAuthCheck = System.currentTimeMillis() to true
         val images = result.optJSONArray("images") ?: return emptyList()
