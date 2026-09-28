@@ -70,6 +70,22 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         "hv2tcomics.com",
     )
 
+    /**
+     * How long the answer to [isAuthorized] stays cached. The
+     * SourceAuthActivity re-asks on every `onPageFinished` —
+     * including the multiple intermediate hops of a Discord OAuth
+     * flow — and each answer that falls through the cache triggers
+     * a full [evaluateJs] round-trip (which on the shipped
+     * `WebViewExecutor` replaces the WebView content and allocates
+     * a fresh empty page). 10 s is short enough to keep the source
+     * settings UI feeling current, and long enough that a typical
+     * OAuth round-trip (5–20 s) only hits the slow path once.
+     */
+    private val authCacheTtlMs = 10_000L
+
+    @Volatile
+    private var cachedAuthCheck: Pair<Long, Boolean>? = null
+
     override val userAgentKey = ConfigKey.UserAgent(
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.46 Mobile Safari/537.36",
     )
@@ -149,13 +165,37 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      *     `/api/users/me` (the same call the SPA's AuthProvider makes);
      *     a 200 means the cookie jar carries a valid session.
      *
-     * If we returned `true` as soon as the age-gate cookie landed, the
-     * SourceAuthActivity would `finish()` immediately and the user
-     * could never reach the "Đăng nhập với Discord" button. By gating
-     * on the session as well, the activity stays open through the
-     * full two-step flow.
+     * The whole result is **cached for 10 seconds**. The auth activity
+     * calls this on every page-finished event — including the
+     * several intermediate pages of the Discord OAuth flow
+     * (login → 2FA → consent → callback). Each call goes through
+     * [MangaLoaderContext.evaluateJs], which on this app's
+     * `WebViewExecutor` runs `loadDataWithBaseURL(baseUrl, " ", ...)`
+     * + `evaluateJavascript(...)` + `webView.reset()`. The
+     * `loadDataWithBaseURL` REPLACES the page the user is looking at,
+     * which interrupts an in-flight OAuth redirect; `reset()` then
+     * loads yet another empty page. On a multi-step OAuth (5+ page
+     * finishes in a few seconds) this is enough to freeze the UI
+     * and balloon memory until the OS reclaims the process.
+     *
+     * Caching the boolean here cuts the whole `evaluateJs` chain to
+     * one call per OAuth attempt; subsequent page-finished events
+     * return the cached answer immediately and the WebView can keep
+     * loading the next OAuth step uninterrupted. The 10 s window is
+     * short enough that the user-visible state in source settings
+     * refreshes quickly after they log in, but long enough that the
+     * typical Discord OAuth completes without triggering a second
+     * intrusive re-check.
      */
-    override suspend fun isAuthorized(): Boolean = ensureAgeGateCookie() && checkSessionCookie()
+    override suspend fun isAuthorized(): Boolean {
+        val cached = cachedAuthCheck
+        if (cached != null && System.currentTimeMillis() - cached.first < authCacheTtlMs) {
+            return cached.second
+        }
+        val result = ensureAgeGateCookie() && checkSessionCookie()
+        cachedAuthCheck = System.currentTimeMillis() to result
+        return result
+    }
 
     override suspend fun getUsername(): String? = null
 
@@ -164,20 +204,35 @@ internal class Hv2tComics(context: MangaLoaderContext) :
 
     private suspend fun ensureAgeGateCookie(): Boolean {
         if (hasAgeGateCookie()) return true
-        // The SourceAuthActivity has already loaded authUrl (the homepage)
-        // by the time `isAuthorized()` is called, so the WebView's cookie
-        // store has the gate cookie set in case the user already went
-        // through the confirm step. readDocumentCookie() returns null while
-        // the page is still on `about:blank` (the very first call), which
-        // is also the point where the user has not opened the source yet
-        // — treat that as "not authorized" so the sign-in row stays
-        // enabled.
+        // The SourceAuthActivity has already loaded authUrl (the sign-in
+        // page) by the time `isAuthorized()` is called, so the
+        // WebView's cookie store has the gate cookie set in case the
+        // user already went through the confirm step.
+        // readDocumentCookie() returns null while the page is still on
+        // `about:blank` (the very first call), which is also the point
+        // where the user has not opened the source yet — treat that
+        // as "not authorized" so the sign-in row stays enabled.
         val raw = readDocumentCookie() ?: return false
         val match = ADULT_GATE_REGEX.find(raw) ?: return false
         val value = match.groupValues[1]
         if (value.isBlank()) return false
         context.cookieJar.insertCookies(domain, "$ADULT_GATE_COOKIE=$value")
+        // The age-gate just flipped, so the previously cached
+        // `isAuthorized` (from a stale install or a previous sign-in
+        // attempt) is no longer accurate. Drop it so the very next
+        // call goes through checkSessionCookie and refreshes state.
+        cachedAuthCheck = null
         return true
+    }
+
+    /**
+     * Drops the cached [isAuthorized] answer. Production code does
+     * not need this — the 10 s TTL in [authCacheTtlMs] handles
+     * staleness — but tests can call it between scenarios so they
+     * can drive the auth flow without having to sleep past the TTL.
+     */
+    fun clearAuthCache() {
+        cachedAuthCheck = null
     }
 
     private suspend fun readDocumentCookie(): String? = runCatching {
@@ -319,6 +374,13 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         }
         val parsed = parseChapterUrl(chapter.url)
         val result = readDecryptedChapter(parsed.mangaId, parsed.chapterId, chapter.url)
+        // Reaching this line means the chapter API + WASM decrypt both
+        // succeeded, which only happens with a valid session cookie in
+        // the WebView. Promote the cached answer to `true` so the
+        // source-settings row flips from "Đăng nhập" to its signed-in
+        // state immediately, even if the 10 s [authCacheTtlMs] window
+        // hasn't expired yet.
+        cachedAuthCheck = System.currentTimeMillis() to true
         val images = result.optJSONArray("images") ?: return emptyList()
         return (0 until images.length()).mapNotNull { index ->
             val url = images.optString(index).takeIf { it.isNotBlank() } ?: return@mapNotNull null
