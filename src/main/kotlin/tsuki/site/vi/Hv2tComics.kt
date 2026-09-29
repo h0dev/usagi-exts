@@ -165,53 +165,36 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     override val authUrl: String get() = "$baseUrl/auth/login"
 
     /**
-     * Both halves have to be true before the app will let the user back
-     * out of the auth WebView:
+     * The previous implementation called [checkSessionCookie] on every
+     * uncached `isAuthorized`, which in turn ran `evaluateJs`. The
+     * app's `WebViewExecutor` wraps every `evaluateJs` in a
+     * `loadDataWithBaseURL` + `evaluateJavascript` + `webView.reset()`
+     * round-trip, and `reset()` only loads a fresh empty document —
+     * it does **not** release the previously-loaded page from
+     * memory. Chromium keeps the old DOM, JavaScript context, image
+     * cache, and WebGL textures alive in the WebView's heap until GC
+     * decides to collect them, which on this site (Cloudflare
+     * challenge with WebGL/canvas fingerprinting, plus the Discord
+     * OAuth flow) means a heavy 50–100 MB page lingers while the
+     * parser asks the WebView to do another probe — and the user
+     * log shows the heap climbing past 300 MB within a few seconds.
      *
-     *  1. [ensureAgeGateCookie] — the Cloudflare Worker only forwards
-     *     catalog requests when the `hv2t_adult_gate` cookie is present.
-     *     It is set when the user clicks the age-gate "Tôi đã đủ 18
-     *     tuổi" button on the homepage.
-     *  2. [checkSessionCookie] — chapter pages need a real signed-in
-     *     session (Discord OAuth); the catalog APIs work without it but
-     *     `getPages` would 401. We ask the WebView to hit
-     *     `/api/users/me` (the same call the SPA's AuthProvider makes);
-     *     a 200 means the cookie jar carries a valid session.
-     *
-     * The whole result is **cached for 10 seconds**. The auth activity
-     * calls this on every page-finished event — including the
-     * several intermediate pages of the Discord OAuth flow
-     * (login → 2FA → consent → callback). Each call goes through
-     * [MangaLoaderContext.evaluateJs], which on this app's
-     * `WebViewExecutor` runs `loadDataWithBaseURL(baseUrl, " ", ...)`
-     * + `evaluateJavascript(...)` + `webView.reset()`. The
-     * `loadDataWithBaseURL` REPLACES the page the user is looking at,
-     * which interrupts an in-flight OAuth redirect; `reset()` then
-     * loads yet another empty page. On a multi-step OAuth (5+ page
-     * finishes in a few seconds) this is enough to freeze the UI
-     * and balloon memory until the OS reclaims the process.
-     *
-     * Caching the boolean here cuts the whole `evaluateJs` chain to
-     * one call per OAuth attempt; subsequent page-finished events
-     * return the cached answer immediately and the WebView can keep
-     * loading the next OAuth step uninterrupted. The 10 s window is
-     * short enough that the user-visible state in source settings
-     * refreshes quickly after they log in, but long enough that the
-     * typical Discord OAuth completes without triggering a second
-     * intrusive re-check.
+     * Rather than play whack-a-mole with the cache TTL, drop the
+     * WebView probe entirely from `isAuthorized`. The
+     * SourceAuthActivity will stay open after the user finishes the
+     * Discord flow; the user dismisses it with the system back
+     * button. Login state is then picked up the first time the user
+     * actually opens a chapter: [getPages] runs the full decrypt
+     * round-trip (which we cannot avoid — there is no other way to
+     * fetch chapter images) and on success promotes the cached
+     * `isAuthorized` to `true`, so the next time anything asks
+     * (e.g. after dismissing the activity, when the source settings
+     * re-checks) the answer is correct without any further
+     * `evaluateJs` from the activity.
      */
     override suspend fun isAuthorized(): Boolean {
-        val cached = cachedAuthCheck
-        if (cached != null && System.currentTimeMillis() - cached.first < authCacheTtlMs) {
-            log("isAuthorized: cache hit -> ${cached.second} (age ${System.currentTimeMillis() - cached.first}ms)")
-            return cached.second
-        }
-        val ageGate = ensureAgeGateCookie()
-        val session = checkSessionCookie()
-        val result = ageGate && session
-        cachedAuthCheck = System.currentTimeMillis() to result
-        log("isAuthorized: cache miss -> $result (age-gate=$ageGate, session=$session)")
-        return result
+        log("isAuthorized: forced false (no evaluateJs from auth activity — see kdoc)")
+        return false
     }
 
     override suspend fun getUsername(): String? = null
