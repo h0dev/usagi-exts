@@ -15,6 +15,7 @@ import tsuki.network.CloudFlareHelper
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
 import tsuki.util.*
+import tsuki.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
@@ -111,6 +112,8 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	/** The homepage — it is Cloudflare-gated, so opening it renders the challenge. */
 	private val baseUrl: String get() = "https://$domain/"
+
+	private val tagsLazy = suspendLazy(initializer = { fetchAvailableTags() })
 
 	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
 
@@ -229,7 +232,10 @@ internal class LxManga(context: MangaLoaderContext) :
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = fetchAvailableTags(),
+		// Cached: the app asks for the filter options every time the sheet
+		// opens, and every fetch here costs a WebView round trip that has
+		// to compete for the app's single WebViewExecutor slot.
+		availableTags = tagsLazy.get(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.PAUSED),
 	)
 
@@ -501,8 +507,10 @@ internal class LxManga(context: MangaLoaderContext) :
 		var challenged = false
 		for (attempt in 1..WEBVIEW_ATTEMPTS) {
 			if (attempt > 1) delay(WEBVIEW_RETRY_DELAY_MS)
+			val startedAt = System.currentTimeMillis()
 			html = webViewFetch(url)
-			log("webview attempt $attempt/$WEBVIEW_ATTEMPTS → ${html.length} chars: ${html.take(80).replace('\n', ' ')}")
+			val took = System.currentTimeMillis() - startedAt
+			log("webview attempt $attempt/$WEBVIEW_ATTEMPTS → ${html.length} chars in ${took}ms: ${html.take(80).replace('\n', ' ')}")
 			when {
 				// A real challenge: waiting will not change the answer.
 				html == CHALLENGE -> {
@@ -515,6 +523,12 @@ internal class LxManga(context: MangaLoaderContext) :
 				}
 			}
 		}
+		// Everything failed. A no-network script tells the two possible causes
+		// apart: if even this times out, the app's WebViewExecutor is occupied
+		// (its mutex is shared with the invisible captcha resolver); if it
+		// answers instantly, the WebView itself is fine and the page fetch is
+		// what does not fit into the app's 4 s evaluateJs budget.
+		log("webview ping (no network): ${runCatching { context.evaluateJs(url, PING_SCRIPT) }.getOrNull() ?: "TIMEOUT"}")
 		log("webview fetch failed (challenged=$challenged, hadClearance=${hasClearance()})")
 		// The jar holding a clearance means the auth screen would open and
 		// immediately close again (isAuthorized() == true): that is the
@@ -651,16 +665,20 @@ internal class LxManga(context: MangaLoaderContext) :
 		/**
 		 * Attempts at the WebView transport. The app runs every
 		 * `evaluateJs` and every invisible captcha resolve on one
-		 * mutex (held up to 20 s by `WebViewExecutor.tryResolveCaptcha`),
-		 * so a single attempt can easily come back empty while the app
-		 * is busy elsewhere.
+		 * mutex, and `WebViewExecutor.tryResolveCaptcha` holds it for
+		 * up to 20 s per attempt, so a single try can easily land
+		 * inside somebody else's window. Six tries with 1 s between
+		 * them covers a full resolve cycle.
 		 */
-		private const val WEBVIEW_ATTEMPTS = 3
+		private const val WEBVIEW_ATTEMPTS = 6
 
-		private const val WEBVIEW_RETRY_DELAY_MS = 2_500L
+		private const val WEBVIEW_RETRY_DELAY_MS = 1_000L
 
 		/** How long to trust "OkHttp is rejected here" before probing it again. */
 		private const val OKHTTP_RETRY_AFTER = 5 * 60_000L
+
+		/** Diagnostic only: does the WebView answer at all (no network involved)? */
+		private val PING_SCRIPT: String = "(function () { return 'pong'; })()"
 
 		private const val NOT_CLEARED_MESSAGE =
 			"LXManga: chưa vượt qua Cloudflare — bấm 'Đăng nhập' trong cài đặt nguồn để giải captcha rồi thử lại"
@@ -680,7 +698,6 @@ internal class LxManga(context: MangaLoaderContext) :
 				try {
 					const resp = await fetch(location.href, {
 						credentials: 'include',
-						cache: 'no-store',
 						redirect: 'follow'
 					});
 					if (resp.status === 403 || resp.status === 503) return 'CF';
