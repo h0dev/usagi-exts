@@ -45,37 +45,44 @@ import kotlin.time.Duration.Companion.seconds
  *
  * The app's cookie jar is [tsuki.util.CookieJar] backed by
  * `CookieManager` (`AndroidCookieJar`), so those cookies are visible
- * to the parser's plain OkHttp client: once the captcha is solved,
- * every catalog / details / tag request goes through over plain HTTP
- * with no WebView involved. That is the whole point of the row —
- * solve once, then browse normally.
+ * to the parser — a device log confirmed the jar really does hold
+ * `cf_clearance`. [isAuthorized] answers "is that cookie there?",
+ * which is the same signal the app's own `CloudFlareClient` uses, so
+ * the row greys out and `SourceAuthActivity` closes itself with the
+ * "Authorized" toast the moment the user is through.
  *
- * [isAuthorized] answers "is `cf_clearance` already in the jar?",
- * which is the same signal the app's own `CloudFlareClient` uses to
- * decide the challenge has been passed. Consequences: the row is
- * disabled while a valid clearance exists, and `SourceAuthActivity`
- * closes itself (with the "Authorized" toast) the moment the user
- * proves they are human.
+ * ## Two transports, because a clearance is not always portable
  *
- * ## Captcha flow (automatic)
+ * A `cf_clearance` cookie is not just a password: Cloudflare can bind
+ * it to the *client fingerprint* (TLS/JA4 + User-Agent) it was issued
+ * to. On this site that is exactly what happens — the device log shows
+ * the jar full of `cf_clearance` and the request still coming back as
+ * a "Just a moment…" challenge. A Java/OkHttp client is not the
+ * browser the clearance was minted for, so presenting the cookie is
+ * not enough.
  *
- * Every plain HTTP call goes through the app's own
- * `CloudFlareInterceptor`, which is installed on the HTTP client
- * every parser inherits. On a "Just a moment…" response it throws
- * `CloudFlareProtectedException`, the app's exception resolver opens
- * the dedicated `CloudFlareActivity` ("Solve"), and that activity
- * watches the cookie jar for a *new* `cf_clearance` — when it
- * appears it reports success and the original request is retried,
- * this time with the clearance cookie attached.
+ * [fetchDocument] therefore tries two transports, in order:
  *
- * [fetchDocument] still carries a manual
- * [CloudFlareHelper.checkResponseForProtection] check +
- * [MangaLoaderContext.requestBrowserAction] as a fallback for hosts
- * whose HTTP client has no such interceptor (the app's
- * `requestBrowserAction` throws, so the app opens a browser for the
- * user to solve the challenge in). With `CloudFlareInterceptor`
- * present — i.e. on Usagi — the interceptor throws first and this
- * fallback never runs.
+ *  1. plain OkHttp — fast, and the host app's `CloudFlareInterceptor`
+ *     hooks into it. Used whenever Cloudflare accepts it, which is
+ *     also the case on sites that don't bind the clearance.
+ *
+ *  2. the app's WebView (`evaluateJs` + `fetch`) — a real Chromium
+ *     network stack, i.e. a client Cloudflare trusts. The stub
+ *     document `evaluateJs` creates has the page URL as its origin, so
+ *     the fetch is same-origin and carries the HttpOnly clearance
+ *     plus the fingerprint it was issued to. The parsed HTML is
+ *     identical, so every selector below is shared.
+ *
+ * When even the WebView is challenged (no clearance yet, or an
+ * expired one), [AuthRequiredException] makes the app surface the
+ * "Đăng nhập" flow — which is the same WebView the challenge needs,
+ * so solving it there unblocks transport 2 immediately.
+ *
+ * Note: `WebView.evaluateJavascript` hands string results back
+ * JSON-encoded, and older builds do not resolve promises; both are
+ * handled ([decodeJsResult], [FETCH_SCRIPT_SYNC]). The app also caps
+ * a single `evaluateJs` call at 4 s, so both scripts must return fast.
  *
  * ## Chapter reader
  *
@@ -210,6 +217,9 @@ internal class LxManga(context: MangaLoaderContext) :
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val url = buildListUrl(page, order, filter)
 		val doc = fetchDocument(url)
+		// The markup renders every card twice (a mobile and a desktop
+		// block), so 60 mangas arrive as 120 `div.relative` nodes. The
+		// paginator counts what we return, so collapse them.
 		return doc.select("div.grid div.relative").mapNotNull { div ->
 			val href = div.selectFirst("a[href^=/truyen/]")?.attrAsRelativeUrl("href")
 				?: return@mapNotNull null
@@ -234,7 +244,7 @@ internal class LxManga(context: MangaLoaderContext) :
 				authors = emptySet(),
 				source = source,
 			)
-		}
+		}.distinctBy { it.url }
 	}
 
 	// ============================== Details ===============================
@@ -296,9 +306,9 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		log("getPages $chapterUrl | jar=${jarName()} cookies=[${cookieNames()}]")
+		log("getPages $chapterUrl | cookies=[${cookieNames()}] clearance=${clearanceAge()}")
 		val raw = runCatching { context.evaluateJs(chapterUrl, PAGES_SCRIPT) }.getOrNull()
-		val trimmed = raw?.trim().orEmpty()
+		val trimmed = decodeJsResult(raw)
 		log("getPages js returned ${trimmed.length} chars: ${trimmed.take(120)}")
 		if (trimmed.isEmpty() || trimmed.startsWith("ERR:")) {
 			val reason = trimmed.removePrefix("ERR:").trim()
@@ -415,38 +425,120 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/**
-	 * Fetch one of the static HTML pages through OkHttp — plain HTTP,
-	 * no WebView. This is only possible because the clearance cookie
-	 * lives in the shared jar (see the class KDoc).
+	 * Fetch one of the static HTML pages.
 	 *
-	 * On Usagi the inherited `CloudFlareInterceptor` throws
-	 * `CloudFlareProtectedException` *inside* [okhttp3.OkHttpClient]
-	 * as soon as it sees a "Just a moment…" body; the app then shows
-	 * its dedicated captcha screen, stores the fresh `cf_clearance`
-	 * in the jar and retries. So on Usagi this function simply never
-	 * sees a challenge — it either returns the page or propagates the
-	 * exception.
+	 * Two transports, tried in order:
 	 *
-	 * The explicit check below is a fallback for hosts whose HTTP
-	 * client has no such interceptor: in that case we detect the
-	 * challenge ourselves and hand the URL to
-	 * [MangaLoaderContext.requestBrowserAction], which the app turns
-	 * into a captcha prompt (and which is declared `Nothing` — it
-	 * throws — so this function never returns when CF is detected
-	 * that way).
+	 *  1. **plain OkHttp** — fast, and it is what the host app's
+	 *     `CloudFlareInterceptor` hooks into. When the jar holds a
+	 *     `cf_clearance` that Cloudflare accepts, this is all we need.
+	 *
+	 *  2. **the app's WebView** (`evaluateJs` + `fetch`). Some
+	 *     Cloudflare setups bind `cf_clearance` not only to the cookie
+	 *     but to the *client fingerprint* (TLS/JA4 + UA) it was issued
+	 *     to, so a clearance the WebView earned is rejected when a
+	 *     Java/OkHttp client presents it — even though the cookie is
+	 *     sitting right there in the jar. The WebView is a real
+	 *     Chromium network stack, i.e. the client Cloudflare trusts, so
+	 *     when OkHttp is challenged we simply ask the WebView for the
+	 *     page instead. It returns the same HTML, so all the selectors
+	 *     below are unchanged.
+	 *
+	 * If even the WebView is challenged (no clearance yet, or an
+	 * expired one), [AuthRequiredException] makes the app surface the
+	 * "Đăng nhập" flow, which opens the challenge in a WebView and
+	 * keeps it open until [isAuthorized] sees the clearance — the same
+	 * WebView that [fetchViaWebView] then uses.
 	 */
 	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
-		log("GET $url | jar=${jarName()} cookies=[${cookieNames()}]")
-		val response = webClient.httpGet(url)
-		log("-> HTTP ${response.code} for $url")
+		val response = runCatching { webClient.httpGet(url) }.getOrElse { e ->
+			if (!isCloudFlareRejection(e)) throw e
+			log("okhttp rejected by Cloudflare ($url): ${e.javaClass.simpleName}")
+			return fetchViaWebView(url, "okhttp=CF")
+		}
 		val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
 		if (protection != CloudFlareHelper.PROTECTION_NOT_DETECTED) {
-			log("!! unprotected response: CF protection=$protection — falling back to requestBrowserAction")
+			// No interceptor in this host build — same situation, same answer.
 			response.close()
-			context.requestBrowserAction(this, url)
+			log("plain response is a Cloudflare challenge ($url, protection=$protection)")
+			return fetchViaWebView(url, "plain=CF")
 		}
+		log("ok $url via okhttp (HTTP ${response.code})")
 		return response.parseHtml()
 	}
+
+	/** Fetch the same page from inside the app's WebView. */
+	private suspend fun fetchViaWebView(url: String, why: String): org.jsoup.nodes.Document {
+		log("webview fetch ($why) $url | cookies=[${cookieNames()}] clearance=${clearanceAge()}")
+		val html = webViewFetch(url)
+		log("webview fetch → ${html.length} chars: ${html.take(120).replace('\n', ' ')}")
+		when {
+			html == CHALLENGE -> throw AuthRequiredException(
+				source,
+				IllegalStateException(NOT_CLEARED_MESSAGE),
+			)
+
+			html.startsWith(ERROR_PREFIX) -> throw AuthRequiredException(
+				source,
+				IllegalStateException("LXManga: webview không tải được trang (${html.removePrefix(ERROR_PREFIX).trim()})"),
+			)
+
+			html.length < MIN_HTML_LENGTH || looksLikeChallenge(html) -> throw AuthRequiredException(
+				source,
+				IllegalStateException(NOT_CLEARED_MESSAGE),
+			)
+
+			else -> return org.jsoup.Jsoup.parse(html, url)
+		}
+	}
+
+	/**
+	 * Run `fetch` inside the WebView. The WebView is a real browser
+	 * network stack, so the HttpOnly `cf_clearance` in `CookieManager`
+	 * — and the matching client fingerprint — are used exactly as when
+	 * the user solves the challenge by hand.
+	 *
+	 * `WebView.evaluateJavascript` hands its result back JSON-encoded
+	 * (a returned string arrives quoted and escaped), hence
+	 * [decodeJsResult]. Promises are resolved by the platform, but if
+	 * they are not on some WebView build the result is `{}` — in that
+	 * case we retry with a synchronous XHR, which cannot be mishandled.
+	 */
+	private suspend fun webViewFetch(url: String): String {
+		val async = runCatching { context.evaluateJs(url, FETCH_SCRIPT) }.getOrNull()
+		val decoded = decodeJsResult(async)
+		if (decoded.isNotEmpty() && decoded != "{}") {
+			return decoded
+		}
+		log("webview async fetch returned '${async?.take(40)}' — retrying synchronously")
+		val sync = runCatching { context.evaluateJs(url, FETCH_SCRIPT_SYNC) }.getOrNull()
+		return decodeJsResult(sync)
+	}
+
+	/** Undo the JSON encoding `WebView.evaluateJavascript` applies to string results. */
+	private fun decodeJsResult(raw: String?): String {
+		val text = raw?.trim().orEmpty()
+		if (text.length < 2 || !text.startsWith("\"") || !text.endsWith("\"")) {
+			return text
+		}
+		return runCatching { org.json.JSONTokener(text).nextValue() as? String ?: text }.getOrDefault(text)
+	}
+
+	/** True when [e] (or anything it wraps) is the host app's Cloudflare rejection. */
+	private fun isCloudFlareRejection(e: Throwable): Boolean {
+		var cause: Throwable? = e
+		while (cause != null) {
+			if (cause.javaClass.simpleName.startsWith("CloudFlare")) return true
+			cause = cause.cause
+		}
+		return false
+	}
+
+	private fun looksLikeChallenge(html: String): Boolean =
+		html.contains("challenge-platform") ||
+			html.contains("cf-chl") ||
+			html.contains("challenges.cloudflare.com") ||
+			html.contains("Just a moment")
 
 	// ============================== Diagnostics ===============================
 
@@ -460,6 +552,30 @@ internal class LxManga(context: MangaLoaderContext) :
 		context.cookieJar.getCookies(domain).joinToString(",") { it.name }
 	}.getOrElse { "err:${it::class.simpleName}" }
 
+	/**
+	 * Age of the `cf_clearance` in the jar, parsed out of its value
+	 * (`<hash>-<issuedAtUnix>-<version>-…`). A *stale* clearance means
+	 * the challenge never actually passed, a *fresh* one means it
+	 * passed and the plain-HTTP client is the one being rejected.
+	 */
+	private fun clearanceAge(): String {
+		val cookie = runCatching { CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) }.getOrNull()
+			?: return "none"
+		val issuedAt = Regex("""-(\d{9,11})-""").find(cookie)?.groupValues?.get(1)?.toLongOrNull()
+			?: return "unknown"
+		val age = System.currentTimeMillis() / 1000 - issuedAt
+		return if (age < 0) "from the future?" else "${age}s old"
+	}
+
+	/** Diagnostic only: can the WebView itself load [url] right now? */
+	private suspend fun probeWebView(url: String): String {
+		val now = System.currentTimeMillis()
+		lastProbe?.takeIf { now - it.first < 30_000L }?.let { return "${it.second} (cached)" }
+		val result = decodeJsResult(runCatching { context.evaluateJs(url, PROBE_SCRIPT) }.getOrNull()).ifEmpty { "empty" }
+		lastProbe = now to result
+		return result
+	}
+
 	private fun sortQuery(order: SortOrder): String = when (order) {
 		SortOrder.POPULARITY -> "-views"
 		SortOrder.NEWEST -> "-created_at"
@@ -470,6 +586,64 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	companion object {
 		private const val LOG_TAG = "[LxManga]"
+
+		/** Returned by the fetch scripts when the response is a Cloudflare challenge. */
+		private const val CHALLENGE = "CF"
+
+		private const val ERROR_PREFIX = "ERR:"
+
+		/** Anything shorter than this is a challenge shell, not a page. */
+		private const val MIN_HTML_LENGTH = 512
+
+		private const val NOT_CLEARED_MESSAGE =
+			"LXManga: chưa vượt qua Cloudflare — bấm 'Đăng nhập' trong cài đặt nguồn để giải captcha rồi thử lại"
+
+		/**
+		 * Fetch the page *inside* the WebView. `evaluateJs(url, …)`
+		 * loads a stub document whose origin is `url`, so this fetch is
+		 * same-origin and goes through the WebView network stack: the
+		 * HttpOnly `cf_clearance` (and the browser's TLS fingerprint
+		 * that Cloudflare bound it to) are used exactly like a normal
+		 * page load.
+		 *
+		 * The result is a JSON string; [decodeJsResult] unwraps it.
+		 */
+		private val FETCH_SCRIPT: String = """
+			(async () => {
+				try {
+					const resp = await fetch(location.href, {
+						credentials: 'include',
+						cache: 'no-store',
+						redirect: 'follow'
+					});
+					if (resp.status === 403 || resp.status === 503) return 'CF';
+					if (!resp.ok) return 'ERR: HTTP ' + resp.status;
+					return await resp.text();
+				} catch (e) {
+					return 'ERR: ' + (e && e.message ? e.message : String(e));
+				}
+			})()
+		""".trimIndent()
+
+		/**
+		 * Same fetch, but synchronous. Only used when the async form
+		 * comes back as `{}`, which means this WebView build did not
+		 * resolve the promise for us.
+		 */
+		private val FETCH_SCRIPT_SYNC: String = """
+			(function () {
+				try {
+					const xhr = new XMLHttpRequest();
+					xhr.open('GET', location.href, false);
+					xhr.send(null);
+					if (xhr.status === 403 || xhr.status === 503) return 'CF';
+					if (xhr.status < 200 || xhr.status >= 300) return 'ERR: HTTP ' + xhr.status;
+					return xhr.responseText;
+				} catch (e) {
+					return 'ERR: ' + (e && e.message ? e.message : String(e));
+				}
+			})()
+		""".trimIndent()
 
 		/**
 		 * Diagnostic probe: run a same-origin `fetch` inside the app's
