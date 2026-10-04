@@ -1,10 +1,8 @@
 package tsuki.site.vi
 
 import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import tsuki.MangaLoaderContext
-import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
@@ -28,38 +26,40 @@ import kotlin.time.Duration.Companion.seconds
  * first request — every catalog hit returns the standard
  * "Just a moment…" challenge page until the browser proves it is
  * not a bot. The keiyoushi Mihon port handles this with
- * `runWebView` (a Mihon-only API Mihon exposes but Tsuki does not).
+ * `runWebView` (a Mihon-only API that Tsuki does not expose).
  *
- * The Tsuki port has two tools that *do* work for this pattern,
- * and both of them show the user a real captcha instead of an
- * "invisible" WebView probe (which the previous design relied on
- * and which silently looped when the app's
- * [MangaLoaderContext.evaluateJs] WebView did not share cookies
- * with the auth WebView):
+ * ## Login vs captcha
  *
- *   1. [MangaLoaderContext.requestBrowserAction] — the recommended
- *      path on Mihon and Kotatsu. Opens a Chrome Custom Tab on
- *      the URL we passed in, the user solves the Turnstile
- *      captcha, the tab closes, and the host app's implementation
- *      copies the `cf_clearance` cookie from
- *      `CookieManager.getInstance().getCookie(url)` into the OkHttp
- *      jar. Subsequent catalog calls work over OkHttp.
+ * This site does **not** have a user account system — there is
+ * nothing to "log in" to. The only auth gate is the Cloudflare
+ * Turnstile captcha, which is conceptually very different from a
+ * username/password login. The previous design wired
+ * [MangaParserAuthProvider] which made the host app's source
+ * settings screen show a "Đăng nhập" (Sign in) row, and that
+ * confused users into looking for a login form the site does not
+ * have. The current design drops the interface so no such row is
+ * ever rendered; the user is only ever prompted to "solve the
+ * captcha" via [MangaLoaderContext.requestBrowserAction], which the
+ * host app typically surfaces with a captcha-specific affordance.
  *
- *   2. The pre-existing `MangaParserAuthProvider.authUrl` (in-app
- *      WebView) is set as a safety net for apps that wire it up.
- *      These apps re-use the auth WebView for `evaluateJs`, so the
- *      cookies set during the auth flow are still there when
- *      [isAuthorized] probes. The probe just hits the homepage and
- *      checks the status — it does *not* try to read the
- *      HttpOnly `cf_clearance` from `document.cookie`.
+ * ## Captcha flow
  *
- * [CloudFlareHelper.checkResponseForProtection] decides which of
- * the two paths to take. The OkHttp call returns the standard
- * "Just a moment…" 403 on a fresh install; we close the response,
- * call [requestBrowserAction], and let the user solve the captcha.
- * Once the host app hands control back, the OkHttp jar carries
- * `cf_clearance` and the catalog probe at the top of
- * [getListPage] sees a real 200.
+ * Every catalog / details / filter-options call goes through
+ * [fetchDocument], which:
+ *   1. calls OkHttp on the page URL,
+ *   2. asks [CloudFlareHelper.checkResponseForProtection] whether
+ *      the body is a "Just a moment…" challenge,
+ *   3. if it is, hands the URL to
+ *      [MangaLoaderContext.requestBrowserAction] (which throws
+ *      `Nothing`) and lets the host app open a custom tab.
+ *
+ * The user solves the Turnstile captcha in that custom tab. When
+ * the tab closes the host app's `requestBrowserAction`
+ * implementation copies `cf_clearance` out of
+ * `CookieManager.getInstance().getCookie(url)` into the OkHttp
+ * jar. The very next [fetchDocument] call returns 200 and the
+ * catalog renders. (The same prompt fires automatically any time
+ * `cf_clearance` ever expires — no manual retry button needed.)
  *
  * ## Chapter reader
  *
@@ -71,19 +71,19 @@ import kotlin.time.Duration.Companion.seconds
  *   3. hands them to lazysizes to render the `<img>` tags.
  *
  * The only way to make that flow happen on Tsuki is to load the
- * page in a real browser context. [getPages] runs
- * [PAGES_SCRIPT] inside `evaluateJs(chapterUrl, …)`: the script
- * `fetch`es the chapter HTML (same-origin, so the WebView's
- * `cf_clearance` cookie is forwarded), `document.write`s it so
- * every inline `<script>` re-runs including the obfuscated
- * builder, and polls `Object.keys(window)` for the first
- * hex-prefixed property whose value is a non-empty array of
- * strings. Errors are returned as `"ERR:<message>"` so the
- * Kotlin side can distinguish them from a valid JSON array.
+ * page in a real browser context. [getPages] runs [PAGES_SCRIPT]
+ * inside `evaluateJs(chapterUrl, …)`: the script `fetch`es the
+ * chapter HTML (same-origin, so the WebView's `cf_clearance`
+ * cookie is forwarded), `document.write`s it so every inline
+ * `<script>` re-runs including the obfuscated builder, and polls
+ * `Object.keys(window)` for the first hex-prefixed property whose
+ * value is a non-empty array of strings. Errors are returned as
+ * `"ERR:<message>"` so the Kotlin side can distinguish them from
+ * a valid JSON array.
  */
 @MangaSourceParser("LXMANGA", "LXManga", "vi", type = ContentType.HENTAI)
 internal class LxManga(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.LXMANGA, 60), MangaParserAuthProvider {
+	PagedMangaParser(context, MangaParserSource.LXMANGA, 60) {
 
 	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
 
@@ -114,29 +114,6 @@ internal class LxManga(context: MangaLoaderContext) :
 		.add(CommonHeaders.ORIGIN, "https://$domain")
 		.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_WINDOWS)
 		.build()
-
-	private val baseUrl: String get() = "https://$domain"
-
-	// ============================== Auth ==============================
-
-	/**
-	 * The site is gated by Cloudflare. After the user solves the
-	 * challenge in either the SourceAuthActivity WebView (via
-	 * [authUrl]) or a custom tab (via [requestBrowserAction]), the
-	 * host app copies `cf_clearance` into the OkHttp cookie jar
-	 * and we can verify it from there. We deliberately do *not*
-	 * probe a WebView here: on apps that don't share cookies
-	 * between the auth WebView and `evaluateJs` the probe would
-	 * return "CF" forever and lock the user out of the catalog.
-	 */
-	override val authUrl: String get() = baseUrl
-
-	override suspend fun isAuthorized(): Boolean {
-		val cookies = context.cookieJar.loadForRequest("https://$domain/".toHttpUrl())
-		return cookies.any { CloudFlareHelper.isCloudFlareCookie(it.name) }
-	}
-
-	override suspend fun getUsername(): String? = null
 
 	// ============================== List ===============================
 
@@ -312,39 +289,39 @@ internal class LxManga(context: MangaLoaderContext) :
 	 */
 	private fun buildListUrl(page: Int, order: SortOrder, filter: MangaListFilter): String = buildString {
 		append("https://")
-		append(domain)
+		.append(domain)
 
 		when {
 			!filter.query.isNullOrEmpty() -> {
 				append("/tim-kiem")
-				append("?filter[name]=")
-				append(filter.query.urlEncoded())
+				.append("?filter[name]=")
+				.append(filter.query.urlEncoded())
 
 				if (page > 1) {
 					append("&page=")
-					append(page)
+					.append(page)
 				}
 
 				append("&sort=")
-				append(sortQuery(order))
+				.append(sortQuery(order))
 			}
 
 			filter.tags.isNotEmpty() -> {
 				val tag = filter.tags.first()
 				append("/the-loai/")
-				append(tag.key)
-				append("?page=")
-				append(page)
-				append("&sort=")
-				append(sortQuery(order))
+				.append(tag.key)
+				.append("?page=")
+				.append(page)
+				.append("&sort=")
+				.append(sortQuery(order))
 			}
 
 			else -> {
 				append("/danh-sach")
-				append("?sort=")
-				append(sortQuery(order))
-				append("&page=")
-				append(page)
+				.append("?sort=")
+				.append(sortQuery(order))
+				.append("&page=")
+				.append(page)
 			}
 		}
 
@@ -367,12 +344,13 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * Fetch one of the static HTML pages through OkHttp. The site
 	 * is Cloudflare-fronted, so on a fresh install the first hit
 	 * returns the "Just a moment…" challenge page. We hand the
-	 * URL to [MangaLoaderContext.requestBrowserAction] which opens
-	 * a custom tab on the user; after they solve the captcha and
-	 * the host app copies the cookie back to the OkHttp jar, the
-	 * very next call goes through. [requestBrowserAction] is
-	 * declared `Nothing` — it throws — so this function never
-	 * returns when CF is detected.
+	 * URL to [MangaLoaderContext.requestBrowserAction] which the
+	 * host app turns into a captcha prompt (open custom tab, etc.).
+	 * After the user solves the captcha and the host app copies
+	 * `cf_clearance` back to the OkHttp jar, the very next call
+	 * goes through. [requestBrowserAction] is declared `Nothing` —
+	 * it throws — so this function never returns when CF is
+	 * detected.
 	 */
 	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
 		val response = webClient.httpGet(url)
@@ -429,12 +407,12 @@ internal class LxManga(context: MangaLoaderContext) :
 						const keys = Object.keys(window);
 						for (let i = 0; i < keys.length; i++) {
 							const key = keys[i];
-							if (!/^_0x[a-f0-9]+$/i.test(key)) continue;
+							if (!/^_0x[a-f0-9]+${'$'}/i.test(key)) continue;
 							const val = window[key];
 							if (!Array.isArray(val) || val.length === 0) continue;
 							const urls = val.filter(function (u) {
 								return typeof u === 'string' &&
-									/\.(?:jpe?g|png|webp)(?:[?#]|$)/i.test(u);
+									/\.(?:jpe?g|png|webp)(?:[?#]|${'$'})/i.test(u);
 							});
 							if (urls.length > 0) return JSON.stringify(urls);
 						}
