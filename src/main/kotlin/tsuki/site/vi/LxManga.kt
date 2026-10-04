@@ -1,7 +1,9 @@
 package tsuki.site.vi
 
 import okhttp3.Headers
+import okio.IOException
 import org.json.JSONArray
+import org.json.JSONObject
 import org.json.JSONTokener
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
@@ -310,46 +312,71 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
-		val raw = runCatching { context.evaluateJs(chapterUrl, PAGES_SCRIPT) }.getOrNull()
-		val trimmed = decodeJsResult(raw)
-		log("getPages ${chapterUrl.take(60)} → ${trimmed.length} chars: ${trimmed.take(80)}")
-		if (trimmed.isEmpty() || trimmed.startsWith(ERROR_PREFIX)) {
-			val reason = trimmed.removePrefix(ERROR_PREFIX).trim()
-			throw AuthRequiredException(
-				source,
-				IllegalStateException(
-					if (reason.isEmpty())
-						"LXManga: chưa vượt qua Cloudflare — bấm 'Đăng nhập' trong cài đặt nguồn để giải captcha"
-					else
-						"LXManga: không đọc được ảnh ($reason)",
-				),
-			)
+
+		// Download the page with OkHttp first. The app caps a single
+		// `evaluateJs` call at 4 s, and this page is ~900 kB, so letting
+		// the WebView do the download regularly blew that budget. OkHttp
+		// has no such limit, and the app's CloudFlareInterceptor handles a
+		// challenge here exactly as it does for the catalogue.
+		val html = runCatching { webClient.httpGet(chapterUrl).parseRaw() }.getOrElse { e ->
+			log("getPages: fetching $chapterUrl failed: ${e.javaClass.simpleName}: ${e.message}")
+			throw e
 		}
 
-		val arr = runCatching { JSONArray(trimmed) }.getOrElse {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException("LXManga: webview trả về dữ liệu không hợp lệ — ${trimmed.take(80)}"),
-			)
+		val raw = runCatching { context.evaluateJs(chapterUrl, pagesScript(html)) }.getOrNull()
+		val trimmed = decodeJsResult(raw)
+		log("getPages ${chapterUrl.take(60)} → ${trimmed.length} chars: ${trimmed.take(80)}")
+
+		val arr = when {
+			trimmed.isEmpty() -> fail("không đọc được chương (webview không phản hồi)")
+			trimmed.startsWith(ERROR_PREFIX) -> fail("không đọc được ảnh (${trimmed.removePrefix(ERROR_PREFIX).trim()})")
+			else -> runCatching { JSONArray(trimmed) }.getOrElse {
+				fail("webview trả về dữ liệu không hợp lệ — ${trimmed.take(80)}")
+			}
 		}
 
 		if (arr.length() == 0) {
-			throw AuthRequiredException(
-				source,
-				IllegalStateException("LXManga: webview không tìm được ảnh — thử lại chương này"),
-			)
+			fail("webview không tìm được ảnh — thử lại chương này")
 		}
 
 		return (0 until arr.length()).mapNotNull { i ->
 			val url = arr.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
 			MangaPage(
 				id = generateUid(url),
-				url = url,
 				preview = null,
+				url = url,
 				source = source,
 			)
 		}
 	}
+
+	/** [PAGES_SCRIPT] with the already-downloaded chapter markup spliced in. */
+	private fun pagesScript(html: String): String =
+		PAGES_SCRIPT.replace(HTML_PLACEHOLDER, JSONObject.quote(html))
+
+	/**
+	 * Report a chapter failure.
+	 *
+	 * `AuthRequiredException` is the app's "ask the user to sign in"
+	 * signal, and this site has no login at all — solving the Cloudflare
+	 * challenge is the entire gate, and the catalogue proves it is
+	 * already solved. Throwing it here made the app pop the "Đăng nhập"
+	 * screen, which then closed itself immediately (isAuthorized() sees
+	 * the clearance) and popped up again on the retry: a loop that tells
+	 * the user to log in to a site without accounts. So only ask for
+	 * authentication when we genuinely have no clearance; otherwise
+	 * report a plain, retryable error.
+	 */
+	private fun fail(reason: String): Nothing {
+		val message = "LXManga: $reason"
+		if (hasClearance()) {
+			throw IOException(message)
+		}
+		throw AuthRequiredException(source, IllegalStateException(message))
+	}
+
+	private fun hasClearance(): Boolean =
+		runCatching { CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null }.getOrDefault(false)
 
 	// ============================== Tags ===============================
 
@@ -501,32 +528,35 @@ internal class LxManga(context: MangaLoaderContext) :
 		 * itself: the fetch aborts after 2 s and the poll gives up after
 		 * another 0.8 s, well inside the budget.
 		 */
+		private const val HTML_PLACEHOLDER = "__LXMANGA_HTML__"
+
+		/**
+		 * Render the chapter markup we downloaded ourselves and read the
+		 * image URLs out of it.
+		 *
+		 * The chapter page carries no image URLs: it ships an obfuscated
+		 * script that decrypts them into `window["_0x…"]` (the property
+		 * name is randomised on every load). Running that script needs a
+		 * browser, hence `evaluateJs` — but the *download* is done by
+		 * [getPages] with OkHttp and spliced in below, because a single
+		 * `evaluateJs` call is capped at 4 s by the app and a ~900 kB page
+		 * does not reliably fit in that budget together with the script.
+		 *
+		 * `document.write` runs the page's own inline scripts, and the loop
+		 * waits up to 3 s for the decrypted array to appear. Staying inside
+		 * the app's 4 s budget matters: the app waits on a non-cancellable
+		 * continuation while holding its shared WebView mutex, so a call
+		 * that overruns locks every other WebView call in the process.
+		 */
 		private val PAGES_SCRIPT: String = """
 			(async () => {
 				try {
-					const controller = new AbortController();
-					const timer = setTimeout(function () { controller.abort(); }, 2000);
-					let html;
-					try {
-						const resp = await fetch(location.href, {
-							credentials: 'include',
-							signal: controller.signal
-						});
-						clearTimeout(timer);
-						if (resp.status === 403 || resp.status === 503) return 'ERR: chưa vượt qua Cloudflare';
-						if (!resp.ok) return 'ERR: HTTP ' + resp.status;
-						html = await resp.text();
-					} catch (e) {
-						clearTimeout(timer);
-						return 'ERR: ' + (e && e.name === 'AbortError' ? 'trang tải quá chậm' : (e && e.message ? e.message : String(e)));
-					}
-
 					document.open();
-					document.write(html);
+					document.write($HTML_PLACEHOLDER);
 					document.close();
 
 					const start = Date.now();
-					while (Date.now() - start < 800) {
+					while (Date.now() - start < 3000) {
 						const keys = Object.keys(window);
 						for (let i = 0; i < keys.length; i++) {
 							const key = keys[i];
@@ -541,7 +571,7 @@ internal class LxManga(context: MangaLoaderContext) :
 						}
 						await new Promise(function (r) { setTimeout(r, 100); });
 					}
-					return 'ERR: ảnh chưa xuất hiện kịp (thử lại chương này)';
+					return 'ERR: ảnh chưa xuất hiện sau 3s — thử lại chương này';
 				} catch (e) {
 					return 'ERR: ' + (e && e.message ? e.message : String(e));
 				}
