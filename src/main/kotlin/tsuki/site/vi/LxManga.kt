@@ -28,42 +28,57 @@ import kotlin.time.Duration.Companion.seconds
  *
  * The site is a plain server-rendered PHP page on top of a Cloudflare-fronted
  * origin. The catalog (path `/danh-sach`, search `/tim-kiem`, tag
- * pages under `/the-loai/<slug>`) is publicly crawlable: Cloudflare's bot-management lets a real `User-Agent` and a
- * matching TLS fingerprint through with the regular challenge page, so the
- * `OkHttpWebClient` can fetch it after a single CookieJar warm-up. The detail
- * and chapter list share that surface, so a normal `parseHtml()` round-trip
- * is enough once the cookies are in place.
+ * pages under `/the-loai/<slug>`) is publicly crawlable, but every
+ * request to `lxmanga.space` is gated by Cloudflare's "Under Attack"
+ * mode: without a valid `cf_clearance` cookie the response is the
+ * standard "Just a moment…" challenge page. Because `cf_clearance`
+ * is `HttpOnly` the parser cannot read it from
+ * `WebView.document.cookie` to copy it into the OkHttp jar, so the
+ * first catalog hit on a fresh install throws via
+ * [CloudFlareHelper.checkResponseForProtection] and the app's
+ * [MangaLoaderContext.requestBrowserAction] opens a custom tab on
+ * the homepage. After the user clears the challenge, both the
+ * OkHttp jar and the app's WebView `CookieManager` end up with
+ * `cf_clearance` and the rest of the parser works without further
+ * interaction.
  *
- * The chapter reader, however, does not embed the image URLs in the HTML.
- * Instead, the page ships an inline obfuscated script (~600 kB) that
- *   1. fetches `/get_token` to mint a fresh per-chapter `action_token`
- *      (Cloudflare Turnstile-gated),
+ * The chapter reader does not embed the image URLs in the HTML.
+ * Instead the page ships an inline obfuscated script (~600 kB) that
+ *   1. fetches `/get_token` to mint a fresh per-chapter
+ *      `action_token` (Cloudflare Turnstile-gated),
  *   2. XHRs the image URLs into `window["_0x…"]`,
  *   3. hands them to lazysizes to render the `<img>` tags.
  *
- * On Mihon, keiyoushi's `runWebView`+`onPageStarted` hook loads that whole
- * flow in a real WebView and scrapes `window._0x…`. Tsuki's `MangaLoaderContext`
- * only exposes a one-shot `evaluateJs(baseUrl, script)`, so we have to do the
- * same work in a single async IIFE: `fetch()` the chapter HTML, `document.write`
- * it (which re-runs every inline `<script>` in the stub document, including
- * the obfuscated one), then poll `window._0x…` until the array lands. The
- * `get_token` request is same-origin so it picks up the Cloudflare cookies
- * the user set when they confirmed the age-gate in the WebView.
+ * On Mihon, keiyoushi's `runWebView`+`onPageStarted` hook loads that
+ * whole flow in a real WebView and scrapes `window._0x…`. Tsuki's
+ * `MangaLoaderContext` only exposes a one-shot
+ * `evaluateJs(baseUrl, script)`, so we do the same work in a single
+ * async IIFE: `fetch()` the chapter HTML, `document.write` it
+ * (which re-runs every inline `<script>` in the stub document,
+ * including the obfuscated one), then poll `window._0x…` until the
+ * array lands. The `get_token` request is same-origin so it picks
+ * up the `cf_clearance` cookie the user set when they confirmed
+ * Cloudflare in the auth WebView.
  *
- * If the user has not yet passed the Turnstile challenge the `/get_token`
- * response is `{"is_bot": true, "require_verification": true}` and the
- * obfuscated script never sets `_0x…` — `evaluateJs` times out and we throw
- * [AuthRequiredException] so the app shows the source's "Đăng nhập" row and
- * the user can retry once Cloudflare has been satisfied.
+ * If the user has not yet passed the Turnstile challenge the
+ * `/get_token` response is `{"is_bot": true, "require_verification":
+ * true}` and the obfuscated script never sets `_0x…` —
+ * `evaluateJs` times out and we throw [AuthRequiredException] so the
+ * app shows the source's "Đăng nhập" row and the user can retry
+ * once Cloudflare has been satisfied.
+ *
+ * [MangaParserAuthProvider.authUrl] still points at the homepage as
+ * a safety net: some apps surface a "Đăng nhập" row whose only
+ * action is to open the WebView, so the user can also satisfy the
+ * challenge from there. Once `cf_clearance` is in the OkHttp jar
+ * (via either path) the catalog stops calling
+ * [requestBrowserAction].
  */
 @MangaSourceParser("LXMANGA", "LXManga", "vi", type = ContentType.HENTAI)
 internal class LxManga(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.LXMANGA, 60), MangaParserAuthProvider {
 
-	override val configKeyDomain = ConfigKey.Domain(
-		"lxmanga.space",
-		"lxmanga.xyz",
-	)
+	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
 
 	/**
 	 * Keiyoushi uses 3 req/s for the catalog. The image-loading
@@ -93,15 +108,15 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Auth ==============================
 
 	/**
-	 * The site is gated by Cloudflare's Turnstile. The catalog itself
-	 * does not need it (Cloudflare's "Under Attack" mode lets static
-	 * HTML through with a normal challenge cookie), but the chapter
-	 * reader's `/get_token` endpoint requires a Turnstile solution and
-	 * rejects the request with `{"is_bot": true}` otherwise. We treat
-	 * the existence of *any* `cf_*` cookie as the signal that the user
-	 * has at least seen the challenge — the reader will fail loudly
-	 * if the cookie is stale, and that surfaces as
-	 * [AuthRequiredException] from [getPages].
+	 * The site is gated by Cloudflare's "Under Attack" mode. Once
+	 * the user has cleared the challenge we look for *any* cookie
+	 * Cloudflare emits (`cf_*`, `_cf*`, `__cf*` — covered by
+	 * [CloudFlareHelper.isCloudFlareCookie]); the parser does not
+	 * care which exact variant cf_clearance comes back as, just that
+	 * the catalog stops returning 403. The chapter reader will
+	 * still fail loudly if the cookie is stale or has expired —
+	 * that surfaces as [AuthRequiredException] from [getPages] and
+	 * the app re-prompts the user to clear the challenge again.
 	 */
 	override suspend fun isAuthorized(): Boolean {
 		val cookies = context.cookieJar.loadForRequest("https://$domain/".toHttpUrl())
@@ -111,16 +126,12 @@ internal class LxManga(context: MangaLoaderContext) :
 	override suspend fun getUsername(): String? = null
 
 	/**
-	 * `SourceAuthActivity` opens this in a WebView so the user can
-	 * pass the Cloudflare "Verify you are human" / Turnstile
-	 * challenge. After that the cf_clearance cookie is in the
-	 * WebView's CookieManager and the rest of the parser works
-	 * without further interaction.
-	 *
-	 * The chapter page itself is a heavier target than the homepage
-	 * (it ships the obfuscated image-URL builder), so we point the
-	 * auth flow at the lightest path that still drops the
-	 * challenge cookie: the homepage.
+	 * `SourceAuthActivity` opens this in the app's WebView so the
+	 * user can pass the Cloudflare "Verify you are human" /
+	 * Turnstile challenge. After that `cf_clearance` is in both the
+	 * WebView's `CookieManager` (needed for [PAGES_SCRIPT]'s
+	 * same-origin `fetch`) and the OkHttp jar (needed for the
+	 * catalog).
 	 */
 	override val authUrl: String get() = baseUrl
 
@@ -140,78 +151,20 @@ internal class LxManga(context: MangaLoaderContext) :
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = availableTags(),
+		availableTags = loadAvailableTags(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.PAUSED),
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val url = buildString {
-			append("https://")
-			append(domain)
-
-			when {
-				!filter.query.isNullOrEmpty() -> {
-					append("/tim-kiem")
-					append("?filter[name]=")
-					append(filter.query.urlEncoded())
-
-					if (page > 1) {
-						append("&page=")
-						append(page)
-					}
-
-					append("&sort=")
-					append(sortQuery(order))
-				}
-
-				filter.tags.isNotEmpty() -> {
-					val tag = filter.tags.first()
-					append("/the-loai/")
-					append(tag.key)
-					append("?page=")
-					append(page)
-				}
-
-				else -> {
-					append("/danh-sach")
-					append("?sort=")
-					append(sortQuery(order))
-					append("&page=")
-					append(page)
-				}
-			}
-
-			if (filter.query.isNullOrEmpty() && filter.tags.isEmpty()) {
-				// danh-sach path already appended the sort above; nothing
-				// more to do.
-			} else if (filter.tags.isNotEmpty()) {
-				append("&sort=")
-				append(sortQuery(order))
-			}
-
-			if (filter.states.isNotEmpty()) {
-				append("&filter[status]=")
-				filter.states.forEach {
-					append(
-						when (it) {
-							MangaState.ONGOING -> "ongoing,"
-							MangaState.FINISHED -> "completed,"
-							MangaState.PAUSED -> "paused,"
-							else -> "ongoing,completed,paused"
-						},
-					)
-				}
-			}
-		}
-
-		val doc = webClient.httpGet(url).parseHtml()
+		val url = buildListUrl(page, order, filter)
+		val doc = fetchDocument(url)
 		return doc.select("div.grid div.relative").mapNotNull { div ->
 			val href = div.selectFirst("a[href^=/truyen/]")?.attrAsRelativeUrl("href")
 				?: return@mapNotNull null
 			val coverUrl = div.selectFirst("div.cover")?.let { cover ->
 				cover.attrOrNull("data-bg")
-					?: cover.attr("style").cssUrl()?.let { url ->
-						if (url.contains("s3.lxmanga.top")) url.replace("s3.lxmanga.top", domain) else url
+					?: cover.attr("style").cssUrl()?.let { cssUrl ->
+						if (cssUrl.contains("s3.lxmanga.top")) cssUrl.replace("s3.lxmanga.top", domain) else cssUrl
 					}
 			}?.orEmpty()
 
@@ -235,7 +188,7 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Details ===============================
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val root = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+		val root = fetchDocument(manga.url.toAbsoluteUrl(domain))
 		val chapterDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.ROOT).apply {
 			timeZone = TimeZone.getTimeZone("GMT+7")
 		}
@@ -334,12 +287,12 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Interceptor ===============================
 
 	/**
-	 * Cloudflare's image CDN at `s*.lxmanga.xyz` checks the `Referer` /
-	 * `Origin` against the live site. The OkHttp call to the image
-	 * URL has neither header by default, so the CDN rejects the
-	 * request as cross-origin even though the browser would have
-	 * sent them for an `<img>` request. Re-attach them on every
-	 * non-cdn / non-cover request too, for the cases where the
+	 * Cloudflare's image CDN at `s*.lxmanga.xyz` checks the
+	 * `Referer` / `Origin` against the live site. The OkHttp call to
+	 * the image URL has neither header by default, so the CDN
+	 * rejects the request as cross-origin even though the browser
+	 * would have sent them for an `<img>` request. Re-attach them
+	 * on every non-cover request too, for the cases where the
 	 * origin itself cares.
 	 */
 	override fun intercept(chain: Interceptor.Chain): Response {
@@ -368,9 +321,8 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	// ============================== Tags ===============================
 
-	private suspend fun availableTags(): Set<MangaTag> {
-		val url = "https://$domain/the-loai"
-		val doc = webClient.httpGet(url).parseHtml()
+	private suspend fun loadAvailableTags(): Set<MangaTag> {
+		val doc = fetchDocument("https://$domain/the-loai")
 		return doc.select("nav.grid.grid-cols-3.md\\:grid-cols-8 button").mapNotNull { button ->
 			val raw = button.attr("wire:click")
 			val key = raw.substringAfterLast(", '").substringBeforeLast("')")
@@ -384,6 +336,87 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	// ============================== Helpers ===============================
+
+	/**
+	 * Build the URL the catalog endpoints expect. The site has three
+	 * shapes depending on whether the user is searching, filtering
+	 * by tag, or just browsing.
+	 */
+	private fun buildListUrl(page: Int, order: SortOrder, filter: MangaListFilter): String = buildString {
+		append("https://")
+		append(domain)
+
+		when {
+			!filter.query.isNullOrEmpty() -> {
+				append("/tim-kiem")
+				append("?filter[name]=")
+				append(filter.query.urlEncoded())
+
+				if (page > 1) {
+					append("&page=")
+					append(page)
+				}
+
+				append("&sort=")
+				append(sortQuery(order))
+			}
+
+			filter.tags.isNotEmpty() -> {
+				val tag = filter.tags.first()
+				append("/the-loai/")
+				append(tag.key)
+				append("?page=")
+				append(page)
+				append("&sort=")
+				append(sortQuery(order))
+			}
+
+			else -> {
+				append("/danh-sach")
+				append("?sort=")
+				append(sortQuery(order))
+				append("&page=")
+				append(page)
+			}
+		}
+
+		if (filter.states.isNotEmpty()) {
+			append("&filter[status]=")
+			filter.states.forEach {
+				append(
+					when (it) {
+						MangaState.ONGOING -> "ongoing,"
+						MangaState.FINISHED -> "completed,"
+						MangaState.PAUSED -> "paused,"
+						else -> "ongoing,completed,paused"
+					},
+				)
+			}
+		}
+	}
+
+	/**
+	 * Fetch and parse one of the static HTML endpoints. The whole
+	 * site is Cloudflare-fronted, so any request can come back as
+	 * the "Just a moment…" challenge page; if it does, hand the URL
+	 * to [MangaLoaderContext.requestBrowserAction] which opens a
+	 * custom tab for the user to clear the challenge. After the
+	 * user comes back the OkHttp jar carries `cf_clearance` and the
+	 * next call goes through.
+	 *
+	 * [requestBrowserAction] is declared `Nothing` — it throws
+	 * (typically an [AuthRequiredException] the app surfaces to the
+	 * user) — so this function never returns when CF is detected.
+	 */
+	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
+		val response = webClient.httpGet(url)
+		val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
+		if (protection != CloudFlareHelper.PROTECTION_NOT_DETECTED) {
+			response.close()
+			context.requestBrowserAction(this, url)
+		}
+		return response.parseHtml()
+	}
 
 	private fun sortQuery(order: SortOrder): String = when (order) {
 		SortOrder.POPULARITY -> "-views"
@@ -400,13 +433,13 @@ internal class LxManga(context: MangaLoaderContext) :
 		 * single async IIFE because Tsuki only exposes one-shot
 		 * `evaluateJs(baseUrl, script)`.
 		 *
-		 * The chapter URL itself is fetched with `credentials: include`
-		 * so the Cloudflare `cf_clearance` cookie set by
-		 * [MangaParserAuthProvider.authUrl] is forwarded. The fetched
-		 * HTML is then dropped into the stub document with
-		 * `document.write` so every inline `<script>` (including the
-		 * ~600 kB obfuscated image-URL builder) executes as if the
-		 * user had loaded the chapter page directly.
+		 * The chapter URL itself is fetched with
+		 * `credentials: include` so the WebView's `cf_clearance`
+		 * cookie is forwarded. The fetched HTML is then dropped into
+		 * the stub document with `document.write` so every inline
+		 * `<script>` (including the ~600 kB obfuscated image-URL
+		 * builder) executes as if the user had loaded the chapter
+		 * page directly.
 		 *
 		 * The obfuscated script's final act is to populate
 		 * `window["_0x…"]` (a property name is randomised on every
