@@ -543,10 +543,22 @@ internal class LxManga(context: MangaLoaderContext) :
 		 * does not reliably fit in that budget together with the script.
 		 *
 		 * `document.write` runs the page's own inline scripts, and the loop
-		 * waits up to 3 s for the decrypted array to appear. Staying inside
-		 * the app's 4 s budget matters: the app waits on a non-cancellable
+		 * waits for the decrypted array to appear. Staying inside the app's
+		 * 4 s budget matters: the app waits on a non-cancellable
 		 * continuation while holding its shared WebView mutex, so a call
 		 * that overruns locks every other WebView call in the process.
+		 *
+		 * The poll is deliberately short. For comparison, the official
+		 * keiyoushi extension for this site family needs
+		 * `runWebView(timeout = 60.seconds)` with a ~19 kB hook injected on
+		 * `onPageStarted` (it has to wrap fetch/XHR to capture both the
+		 * image URLs and the per-chapter `Token` from `/get_token`, and it
+		 * even simulates clicks on an in-page Turnstile), polling once a
+		 * second. Tsuki/Usagi exposes no such API — only a one-shot
+		 * `evaluateJs` on a blank document that the app caps at 4 s — so
+		 * this can succeed only when the page's reader script finishes
+		 * almost immediately, which is why a failure here is reported
+		 * plainly instead of being retried or turned into a login prompt.
 		 */
 		private val PAGES_SCRIPT: String = """
 			(async () => {
@@ -556,7 +568,7 @@ internal class LxManga(context: MangaLoaderContext) :
 					document.close();
 
 					const start = Date.now();
-					while (Date.now() - start < 3000) {
+					while (Date.now() - start < 1500) {
 						const keys = Object.keys(window);
 						for (let i = 0; i < keys.length; i++) {
 							const key = keys[i];
@@ -571,7 +583,7 @@ internal class LxManga(context: MangaLoaderContext) :
 						}
 						await new Promise(function (r) { setTimeout(r, 100); });
 					}
-					return 'ERR: ảnh chưa xuất hiện sau 3s — thử lại chương này';
+					return 'ERR: ảnh chưa xuất hiện kịp — đóng trang đọc rồi mở lại';
 				} catch (e) {
 					return 'ERR: ' + (e && e.message ? e.message : String(e));
 				}
