@@ -1,6 +1,8 @@
 package tsuki.site.vi
 
+import kotlinx.coroutines.delay
 import okhttp3.Headers
+import okio.IOException
 import org.json.JSONArray
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
@@ -12,7 +14,6 @@ import tsuki.model.*
 import tsuki.network.CloudFlareHelper
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
-import tsuki.network.UserAgents
 import tsuki.util.*
 import java.text.SimpleDateFormat
 import java.util.EnumSet
@@ -118,7 +119,15 @@ internal class LxManga(context: MangaLoaderContext) :
 		keys.add(userAgentKey)
 	}
 
-	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_WINDOWS)
+	/**
+	 * Deliberately *not* overriding [userAgentKey]: it defaults to the
+	 * app's own WebView user agent, which is exactly what every WebView
+	 * in the app sends — the challenge screen, the "Đăng nhập" screen
+	 * and the hidden WebView `evaluateJs` uses. A `cf_clearance` is only
+	 * honoured for the identity it was issued to, so one consistent UA
+	 * everywhere is worth more here than looking like a desktop
+	 * browser; the markup is identical either way.
+	 */
 
 	// ============================== Auth ===============================
 	// There is no account on this site; the "Đăng nhập" row exists so the
@@ -174,6 +183,16 @@ internal class LxManga(context: MangaLoaderContext) :
 	private var lastProbe: Pair<Long, String>? = null
 
 	/**
+	 * Once Cloudflare has rejected an OkHttp request, every later one
+	 * will be rejected identically (the clearance is bound to the
+	 * browser that earned it, not to this client), so skip the wasted
+	 * round trip — and the CF exception it raises inside the app — for
+	 * a while.
+	 */
+	@Volatile
+	private var okHttpBlockedUntil = 0L
+
+	/**
 	 * OkHttp is used for the catalog, details, filter listing and
 	 * chapter image fetches. Image URLs are emitted by the
 	 * obfuscated builder as raw s*.lxmanga.xyz paths with no token
@@ -191,7 +210,7 @@ internal class LxManga(context: MangaLoaderContext) :
 	override fun getRequestHeaders(): Headers = Headers.Builder()
 		.add(CommonHeaders.REFERER, "https://$domain/")
 		.add(CommonHeaders.ORIGIN, "https://$domain")
-		.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_WINDOWS)
+		.add(CommonHeaders.USER_AGENT, config[userAgentKey])
 		.build()
 
 	// ============================== List ===============================
@@ -451,46 +470,70 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * WebView that [fetchViaWebView] then uses.
 	 */
 	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
-		val response = runCatching { webClient.httpGet(url) }.getOrElse { e ->
-			if (!isCloudFlareRejection(e)) throw e
-			log("okhttp rejected by Cloudflare ($url): ${e.javaClass.simpleName}")
-			return fetchViaWebView(url, "okhttp=CF")
+		if (System.currentTimeMillis() >= okHttpBlockedUntil) {
+			val response = runCatching { webClient.httpGet(url) }.getOrElse { e ->
+				if (!isCloudFlareRejection(e)) throw e
+				log("okhttp rejected by Cloudflare ($url): ${e.javaClass.simpleName}")
+				okHttpBlockedUntil = System.currentTimeMillis() + OKHTTP_RETRY_AFTER
+				null
+			}
+			if (response != null) {
+				val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
+				if (protection == CloudFlareHelper.PROTECTION_NOT_DETECTED) {
+					log("ok $url via okhttp (HTTP ${response.code})")
+					return response.parseHtml()
+				}
+				// No interceptor in this host build — same situation, same answer.
+				response.close()
+				log("plain response is a Cloudflare challenge ($url, protection=$protection)")
+				okHttpBlockedUntil = System.currentTimeMillis() + OKHTTP_RETRY_AFTER
+			}
+		} else {
+			log("okhttp recently rejected — going straight to the webview for $url")
 		}
-		val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
-		if (protection != CloudFlareHelper.PROTECTION_NOT_DETECTED) {
-			// No interceptor in this host build — same situation, same answer.
-			response.close()
-			log("plain response is a Cloudflare challenge ($url, protection=$protection)")
-			return fetchViaWebView(url, "plain=CF")
-		}
-		log("ok $url via okhttp (HTTP ${response.code})")
-		return response.parseHtml()
+		return fetchViaWebView(url)
 	}
 
 	/** Fetch the same page from inside the app's WebView. */
-	private suspend fun fetchViaWebView(url: String, why: String): org.jsoup.nodes.Document {
-		log("webview fetch ($why) $url | cookies=[${cookieNames()}] clearance=${clearanceAge()}")
-		val html = webViewFetch(url)
-		log("webview fetch → ${html.length} chars: ${html.take(120).replace('\n', ' ')}")
-		when {
-			html == CHALLENGE -> throw AuthRequiredException(
+	private suspend fun fetchViaWebView(url: String): org.jsoup.nodes.Document {
+		log("webview fetch $url | cookies=[${cookieNames()}] clearance=${clearanceAge()}")
+		var html = ""
+		var challenged = false
+		for (attempt in 1..WEBVIEW_ATTEMPTS) {
+			if (attempt > 1) delay(WEBVIEW_RETRY_DELAY_MS)
+			html = webViewFetch(url)
+			log("webview attempt $attempt/$WEBVIEW_ATTEMPTS → ${html.length} chars: ${html.take(80).replace('\n', ' ')}")
+			when {
+				// A real challenge: waiting will not change the answer.
+				html == CHALLENGE -> {
+					challenged = true
+					break
+				}
+
+				html.length >= MIN_HTML_LENGTH && !looksLikeChallenge(html) -> {
+					return org.jsoup.Jsoup.parse(html, url)
+				}
+			}
+		}
+		log("webview fetch failed (challenged=$challenged, hadClearance=${hasClearance()})")
+		// The jar holding a clearance means the auth screen would open and
+		// immediately close again (isAuthorized() == true): that is the
+		// "it keeps asking me to log in" ping-pong, not a fix. Report a
+		// plain retryable error instead.
+		return if (hasClearance()) {
+			throw IOException(
+				"LXManga: Cloudflare vẫn chặn request — đã thử qua webview ${WEBVIEW_ATTEMPTS} lần, thử lại sau vài giây",
+			)
+		} else {
+			throw AuthRequiredException(
 				source,
 				IllegalStateException(NOT_CLEARED_MESSAGE),
 			)
-
-			html.startsWith(ERROR_PREFIX) -> throw AuthRequiredException(
-				source,
-				IllegalStateException("LXManga: webview không tải được trang (${html.removePrefix(ERROR_PREFIX).trim()})"),
-			)
-
-			html.length < MIN_HTML_LENGTH || looksLikeChallenge(html) -> throw AuthRequiredException(
-				source,
-				IllegalStateException(NOT_CLEARED_MESSAGE),
-			)
-
-			else -> return org.jsoup.Jsoup.parse(html, url)
 		}
 	}
+
+	private fun hasClearance(): Boolean =
+		runCatching { CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null }.getOrDefault(false)
 
 	/**
 	 * Run `fetch` inside the WebView. The WebView is a real browser
@@ -498,21 +541,31 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * — and the matching client fingerprint — are used exactly as when
 	 * the user solves the challenge by hand.
 	 *
+	 * The app serialises every `evaluateJs` and every invisible
+	 * captcha resolve on one mutex, so this call can come back empty
+	 * simply because the app is busy solving something else: it is
+	 * retried by [fetchViaWebView].
+	 *
 	 * `WebView.evaluateJavascript` hands its result back JSON-encoded
 	 * (a returned string arrives quoted and escaped), hence
 	 * [decodeJsResult]. Promises are resolved by the platform, but if
 	 * they are not on some WebView build the result is `{}` — in that
-	 * case we retry with a synchronous XHR, which cannot be mishandled.
+	 * case we retry with a synchronous XHR, which cannot be
+	 * mishandled.
 	 */
 	private suspend fun webViewFetch(url: String): String {
 		val async = runCatching { context.evaluateJs(url, FETCH_SCRIPT) }.getOrNull()
-		val decoded = decodeJsResult(async)
-		if (decoded.isNotEmpty() && decoded != "{}") {
-			return decoded
+		if (async != null) {
+			val decoded = decodeJsResult(async)
+			if (decoded.isNotEmpty() && decoded != "{}") {
+				return decoded
+			}
+			val sync = runCatching { context.evaluateJs(url, FETCH_SCRIPT_SYNC) }.getOrNull()
+			if (sync != null) {
+				return decodeJsResult(sync)
+			}
 		}
-		log("webview async fetch returned '${async?.take(40)}' — retrying synchronously")
-		val sync = runCatching { context.evaluateJs(url, FETCH_SCRIPT_SYNC) }.getOrNull()
-		return decodeJsResult(sync)
+		return ""
 	}
 
 	/** Undo the JSON encoding `WebView.evaluateJavascript` applies to string results. */
@@ -594,6 +647,20 @@ internal class LxManga(context: MangaLoaderContext) :
 
 		/** Anything shorter than this is a challenge shell, not a page. */
 		private const val MIN_HTML_LENGTH = 512
+
+		/**
+		 * Attempts at the WebView transport. The app runs every
+		 * `evaluateJs` and every invisible captcha resolve on one
+		 * mutex (held up to 20 s by `WebViewExecutor.tryResolveCaptcha`),
+		 * so a single attempt can easily come back empty while the app
+		 * is busy elsewhere.
+		 */
+		private const val WEBVIEW_ATTEMPTS = 3
+
+		private const val WEBVIEW_RETRY_DELAY_MS = 2_500L
+
+		/** How long to trust "OkHttp is rejected here" before probing it again. */
+		private const val OKHTTP_RETRY_AFTER = 5 * 60_000L
 
 		private const val NOT_CLEARED_MESSAGE =
 			"LXManga: chưa vượt qua Cloudflare — bấm 'Đăng nhập' trong cài đặt nguồn để giải captcha rồi thử lại"
