@@ -3,6 +3,7 @@ package tsuki.site.vi
 import okhttp3.Headers
 import org.json.JSONArray
 import tsuki.MangaLoaderContext
+import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
@@ -28,38 +29,53 @@ import kotlin.time.Duration.Companion.seconds
  * not a bot. The keiyoushi Mihon port handles this with
  * `runWebView` (a Mihon-only API that Tsuki does not expose).
  *
- * ## Login vs captcha
+ * ## The "Đăng nhập" row is the captcha entry point
  *
- * This site does **not** have a user account system — there is
- * nothing to "log in" to. The only auth gate is the Cloudflare
- * Turnstile captcha, which is conceptually very different from a
- * username/password login. The previous design wired
- * [MangaParserAuthProvider] which made the host app's source
- * settings screen show a "Đăng nhập" (Sign in) row, and that
- * confused users into looking for a login form the site does not
- * have. The current design drops the interface so no such row is
- * ever rendered; the user is only ever prompted to "solve the
- * captcha" via [MangaLoaderContext.requestBrowserAction], which the
- * host app typically surfaces with a captcha-specific affordance.
+ * The site has no user accounts — the only gate is the Cloudflare
+ * Turnstile challenge. But the host app only renders the source
+ * settings' "Đăng nhập" row when the parser implements
+ * [MangaParserAuthProvider] with a non-empty [authUrl], and that row
+ * is the *only* way for the user to open the challenge on demand
+ * (without first hitting a catalog request that 403s). So we do
+ * implement the interface, and point [authUrl] at the homepage: the
+ * app opens it in its in-app browser (`SourceAuthActivity`), the
+ * "Just a moment…" page renders, the user taps the Turnstile
+ * checkbox, and the browser writes the resulting cookies — including
+ * the HttpOnly `cf_clearance` — into `android.webkit.CookieManager`.
  *
- * ## Captcha flow
+ * The app's cookie jar is [tsuki.util.CookieJar] backed by
+ * `CookieManager` (`AndroidCookieJar`), so those cookies are visible
+ * to the parser's plain OkHttp client: once the captcha is solved,
+ * every catalog / details / tag request goes through over plain HTTP
+ * with no WebView involved. That is the whole point of the row —
+ * solve once, then browse normally.
  *
- * Every catalog / details / filter-options call goes through
- * [fetchDocument], which:
- *   1. calls OkHttp on the page URL,
- *   2. asks [CloudFlareHelper.checkResponseForProtection] whether
- *      the body is a "Just a moment…" challenge,
- *   3. if it is, hands the URL to
- *      [MangaLoaderContext.requestBrowserAction] (which throws
- *      `Nothing`) and lets the host app open a custom tab.
+ * [isAuthorized] answers "is `cf_clearance` already in the jar?",
+ * which is the same signal the app's own `CloudFlareClient` uses to
+ * decide the challenge has been passed. Consequences: the row is
+ * disabled while a valid clearance exists, and `SourceAuthActivity`
+ * closes itself (with the "Authorized" toast) the moment the user
+ * proves they are human.
  *
- * The user solves the Turnstile captcha in that custom tab. When
- * the tab closes the host app's `requestBrowserAction`
- * implementation copies `cf_clearance` out of
- * `CookieManager.getInstance().getCookie(url)` into the OkHttp
- * jar. The very next [fetchDocument] call returns 200 and the
- * catalog renders. (The same prompt fires automatically any time
- * `cf_clearance` ever expires — no manual retry button needed.)
+ * ## Captcha flow (automatic)
+ *
+ * Every plain HTTP call goes through the app's own
+ * `CloudFlareInterceptor`, which is installed on the HTTP client
+ * every parser inherits. On a "Just a moment…" response it throws
+ * `CloudFlareProtectedException`, the app's exception resolver opens
+ * the dedicated `CloudFlareActivity` ("Solve"), and that activity
+ * watches the cookie jar for a *new* `cf_clearance` — when it
+ * appears it reports success and the original request is retried,
+ * this time with the clearance cookie attached.
+ *
+ * [fetchDocument] still carries a manual
+ * [CloudFlareHelper.checkResponseForProtection] check +
+ * [MangaLoaderContext.requestBrowserAction] as a fallback for hosts
+ * whose HTTP client has no such interceptor (the app's
+ * `requestBrowserAction` throws, so the app opens a browser for the
+ * user to solve the challenge in). With `CloudFlareInterceptor`
+ * present — i.e. on Usagi — the interceptor throws first and this
+ * fallback never runs.
  *
  * ## Chapter reader
  *
@@ -83,7 +99,10 @@ import kotlin.time.Duration.Companion.seconds
  */
 @MangaSourceParser("LXMANGA", "LXManga", "vi", type = ContentType.HENTAI)
 internal class LxManga(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.LXMANGA, 60) {
+	PagedMangaParser(context, MangaParserSource.LXMANGA, 60), MangaParserAuthProvider {
+
+	/** The homepage — it is Cloudflare-gated, so opening it renders the challenge. */
+	private val baseUrl: String get() = "https://$domain/"
 
 	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
 
@@ -93,6 +112,28 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_WINDOWS)
+
+	// ============================== Auth ===============================
+	// There is no account on this site; the "Đăng nhập" row exists so the
+	// user can open the Cloudflare challenge whenever they want, and the
+	// cf_clearance cookie the browser stores is exactly what the plain
+	// OkHttp client needs to stop getting 403s.
+
+	override val authUrl: String get() = baseUrl
+
+	/**
+	 * True as soon as the jar holds a `cf_clearance` for the domain.
+	 *
+	 * On Usagi the jar is `AndroidCookieJar`, which reads through
+	 * `android.webkit.CookieManager`, so the HttpOnly clearance cookie
+	 * written by the challenge WebView is visible here — that is why
+	 * this check works even though `document.cookie` would not show it.
+	 */
+	override suspend fun isAuthorized(): Boolean =
+		CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null
+
+	/** No account system on this site, so there is no name to show. */
+	override suspend fun getUsername(): String? = null
 
 	/**
 	 * OkHttp is used for the catalog, details, filter listing and
@@ -232,9 +273,9 @@ internal class LxManga(context: MangaLoaderContext) :
 				source,
 				IllegalStateException(
 					if (reason.isEmpty())
-						"LXManga: chưa vượt qua Cloudflare — mở trang nguồn trong webview rồi thử lại"
+						"LXManga: chưa vượt qua Cloudflare — mở 'Đăng nhập' trong cài đặt nguồn để giải captcha rồi thử lại"
 					else
-						"LXManga: không đọc được ảnh ($reason)",
+						"LXManga: không đọc được ảnh ($reason) — nếu là 403 thì giải lại captcha trong 'Đăng nhập'",
 				),
 			)
 		}
@@ -249,7 +290,7 @@ internal class LxManga(context: MangaLoaderContext) :
 		if (arr.length() == 0) {
 			throw AuthRequiredException(
 				source,
-				IllegalStateException("LXManga: webview không tìm được ảnh — có thể captcha đã hết hạn, mở lại trang nguồn"),
+				IllegalStateException("LXManga: webview không tìm được ảnh — captcha có thể đã hết hạn, giải lại trong 'Đăng nhập'"),
 			)
 		}
 
@@ -341,16 +382,25 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/**
-	 * Fetch one of the static HTML pages through OkHttp. The site
-	 * is Cloudflare-fronted, so on a fresh install the first hit
-	 * returns the "Just a moment…" challenge page. We hand the
-	 * URL to [MangaLoaderContext.requestBrowserAction] which the
-	 * host app turns into a captcha prompt (open custom tab, etc.).
-	 * After the user solves the captcha and the host app copies
-	 * `cf_clearance` back to the OkHttp jar, the very next call
-	 * goes through. [requestBrowserAction] is declared `Nothing` —
-	 * it throws — so this function never returns when CF is
-	 * detected.
+	 * Fetch one of the static HTML pages through OkHttp — plain HTTP,
+	 * no WebView. This is only possible because the clearance cookie
+	 * lives in the shared jar (see the class KDoc).
+	 *
+	 * On Usagi the inherited `CloudFlareInterceptor` throws
+	 * `CloudFlareProtectedException` *inside* [okhttp3.OkHttpClient]
+	 * as soon as it sees a "Just a moment…" body; the app then shows
+	 * its dedicated captcha screen, stores the fresh `cf_clearance`
+	 * in the jar and retries. So on Usagi this function simply never
+	 * sees a challenge — it either returns the page or propagates the
+	 * exception.
+	 *
+	 * The explicit check below is a fallback for hosts whose HTTP
+	 * client has no such interceptor: in that case we detect the
+	 * challenge ourselves and hand the URL to
+	 * [MangaLoaderContext.requestBrowserAction], which the app turns
+	 * into a captcha prompt (and which is declared `Nothing` — it
+	 * throws — so this function never returns when CF is detected
+	 * that way).
 	 */
 	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
 		val response = webClient.httpGet(url)
