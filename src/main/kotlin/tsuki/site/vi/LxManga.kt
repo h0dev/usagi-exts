@@ -130,18 +130,41 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * this check works even though `document.cookie` would not show it.
 	 */
 	override suspend fun isAuthorized(): Boolean {
-		val authorized = runCatching {
-			CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null
+		val clearance = runCatching {
+			CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl)
 		}.getOrElse {
 			log("isAuthorized: cookie jar threw ${it::class.simpleName}: ${it.message}")
-			false
+			null
 		}
-		log("isAuthorized=$authorized jar=${jarName()} cookies=${cookieNames()}")
-		return authorized
+		log("isAuthorized jar=${clearance != null} class=${jarName()} cookies=[${cookieNames()}]")
+		if (clearance == null) {
+			// The jar has no clearance. Two very different worlds can
+			// produce that, and the log line below tells them apart:
+			//   * "web=HTTP 200"  → the WebView session is fine, the
+			//     cookie just never reaches the OkHttp jar;
+			//   * "web=HTTP 403"  → the challenge itself is not cleared
+			//     (the WebView is stuck on "Just a moment…").
+			log("isAuthorized webviewProbe=${probeWebView()}")
+		}
+		return clearance != null
+	}
+
+	/** Diagnostic only: is the host reachable from inside the app's WebView session? */
+	private suspend fun probeWebView(): String {
+		val now = System.currentTimeMillis()
+		lastProbe?.takeIf { now - it.first < 30_000L }?.let { return "${it.second} (cached)" }
+		val result = runCatching { context.evaluateJs(baseUrl, PROBE_SCRIPT) }
+			.getOrElse { "ERR: ${it::class.simpleName}" }
+			.orEmpty()
+		lastProbe = now to result
+		return result
 	}
 
 	/** No account system on this site, so there is no name to show. */
 	override suspend fun getUsername(): String? = null
+
+	@Volatile
+	private var lastProbe: Pair<Long, String>? = null
 
 	/**
 	 * OkHttp is used for the catalog, details, filter listing and
@@ -447,6 +470,26 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	companion object {
 		private const val LOG_TAG = "[LxManga]"
+
+		/**
+		 * Diagnostic probe: run a same-origin `fetch` inside the app's
+		 * WebView. Because it goes through the WebView's own network
+		 * stack, the HttpOnly `cf_clearance` from `CookieManager` is
+		 * attached even though `document.cookie` cannot see it.
+		 * "HTTP 200" therefore means "the WebView has a working
+		 * session" — which is exactly the fact the OkHttp jar lookup
+		 * cannot tell us when it fails.
+		 */
+		private val PROBE_SCRIPT: String = """
+			(async () => {
+				try {
+					const resp = await fetch(location.href, { credentials: 'include', cache: 'no-store' });
+					return 'HTTP ' + resp.status;
+				} catch (e) {
+					return 'ERR: ' + (e && e.message ? e.message : String(e));
+				}
+			})()
+		""".trimIndent()
 
 		/**
 		 * Script run inside the WebView to extract the chapter's
