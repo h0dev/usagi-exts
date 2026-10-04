@@ -1,10 +1,9 @@
 package tsuki.site.vi
 
-import okhttp3.Headers
-import okhttp3.Interceptor
-import okhttp3.Response
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
@@ -13,7 +12,6 @@ import tsuki.core.PagedMangaParser
 import tsuki.exception.AuthRequiredException
 import tsuki.model.*
 import tsuki.network.CloudFlareHelper
-import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
 import tsuki.network.UserAgents
 import tsuki.util.*
@@ -26,53 +24,58 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * LXManga (https://lxmanga.space) — Vietnamese hentai manga reader.
  *
- * The site is a plain server-rendered PHP page on top of a Cloudflare-fronted
- * origin. The catalog (path `/danh-sach`, search `/tim-kiem`, tag
- * pages under `/the-loai/<slug>`) is publicly crawlable, but every
- * request to `lxmanga.space` is gated by Cloudflare's "Under Attack"
- * mode: without a valid `cf_clearance` cookie the response is the
- * standard "Just a moment…" challenge page. Because `cf_clearance`
- * is `HttpOnly` the parser cannot read it from
- * `WebView.document.cookie` to copy it into the OkHttp jar, so the
- * first catalog hit on a fresh install throws via
- * [CloudFlareHelper.checkResponseForProtection] and the app's
- * [MangaLoaderContext.requestBrowserAction] opens a custom tab on
- * the homepage. After the user clears the challenge, both the
- * OkHttp jar and the app's WebView `CookieManager` end up with
- * `cf_clearance` and the rest of the parser works without further
- * interaction.
+ * ## Cloudflare "Under Attack" mode
  *
- * The chapter reader does not embed the image URLs in the HTML.
- * Instead the page ships an inline obfuscated script (~600 kB) that
+ * Every request to `lxmanga.space` is gated by Cloudflare's bot
+ * challenge. The cookie the challenge drops, `cf_clearance`, is
+ * `HttpOnly` and there is no API equivalent of the challenge — you
+ * can only get past it by running a real browser through the
+ * challenge UI. The keiyoushi Mihon port does that with a full
+ * `runWebView` (Mihon has it; Tsuki does not). The Tsuki port has
+ * to live with a one-shot `evaluateJs(baseUrl, script)`, so we
+ * route **every** HTTP request through the app's WebView: the
+ * `fetch()` inside the script is same-origin and the WebView's
+ * `CookieManager` (which has `cf_clearance` once the user has cleared
+ * the challenge) forwards the cookie automatically.
+ *
+ * The Tsuki WebView is exposed to the user through two paths:
+ *   1. [MangaParserAuthProvider.authUrl] — the app's "Đăng nhập"
+ *      row opens the homepage in a `SourceAuthActivity` WebView and
+ *      the user taps through the challenge there.
+ *   2. The same `SourceAuthActivity` is reused by every other
+ *      `evaluateJs` call below: the in-app WebView is what actually
+ *      runs the script, and the cookies it picked up from the auth
+ *      flow are the ones that satisfy every subsequent fetch.
+ *
+ * We **do not** fall back to [MangaLoaderContext.requestBrowserAction]
+ * for the catalog. The default implementation opens a custom tab in
+ * the system browser; cookies set there live in a separate cookie
+ * store the app cannot read back, so the catalog would stay 403
+ * even after the user thought they had "logged in". The user-visible
+ * auth path is the in-app WebView only.
+ *
+ * ## Chapter reader
+ *
+ * The chapter page does not embed the image URLs in the HTML. It
+ * ships an inline obfuscated script (~600 kB) that
  *   1. fetches `/get_token` to mint a fresh per-chapter
  *      `action_token` (Cloudflare Turnstile-gated),
  *   2. XHRs the image URLs into `window["_0x…"]`,
  *   3. hands them to lazysizes to render the `<img>` tags.
  *
- * On Mihon, keiyoushi's `runWebView`+`onPageStarted` hook loads that
- * whole flow in a real WebView and scrapes `window._0x…`. Tsuki's
- * `MangaLoaderContext` only exposes a one-shot
- * `evaluateJs(baseUrl, script)`, so we do the same work in a single
- * async IIFE: `fetch()` the chapter HTML, `document.write` it
- * (which re-runs every inline `<script>` in the stub document,
- * including the obfuscated one), then poll `window._0x…` until the
- * array lands. The `get_token` request is same-origin so it picks
- * up the `cf_clearance` cookie the user set when they confirmed
- * Cloudflare in the auth WebView.
+ * We mirror the keiyoushi Mihon approach in a single async IIFE:
+ * `fetch()` the chapter HTML, `document.write` it (which re-runs
+ * every inline `<script>` in the stub document, including the
+ * obfuscated one), then poll `window._0x…` until the array lands.
+ * The `get_token` request is same-origin so it picks up
+ * `cf_clearance` from the WebView's `CookieManager`.
  *
  * If the user has not yet passed the Turnstile challenge the
  * `/get_token` response is `{"is_bot": true, "require_verification":
- * true}` and the obfuscated script never sets `_0x…` —
- * `evaluateJs` times out and we throw [AuthRequiredException] so the
- * app shows the source's "Đăng nhập" row and the user can retry
- * once Cloudflare has been satisfied.
- *
- * [MangaParserAuthProvider.authUrl] still points at the homepage as
- * a safety net: some apps surface a "Đăng nhập" row whose only
- * action is to open the WebView, so the user can also satisfy the
- * challenge from there. Once `cf_clearance` is in the OkHttp jar
- * (via either path) the catalog stops calling
- * [requestBrowserAction].
+ * true}` and the obfuscated script never sets `_0x…`. The script
+ * times out after 30 s and we throw [AuthRequiredException] with a
+ * Vietnamese hint so the app can re-prompt the user to clear the
+ * challenge.
  */
 @MangaSourceParser("LXMANGA", "LXManga", "vi", type = ContentType.HENTAI)
 internal class LxManga(context: MangaLoaderContext) :
@@ -81,12 +84,10 @@ internal class LxManga(context: MangaLoaderContext) :
 	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
 
 	/**
-	 * Keiyoushi uses 3 req/s for the catalog. The image-loading
-	 * WebView path doesn't talk to the catalog, so a single chapter
-	 * open costs at most 1 catalog request (the chapter HTML inside
-	 * `evaluateJs`), then the rest of the work is browser-internal.
-	 * 10 req/s gives the same headroom Tsuki's other Vietnamese
-	 * parsers use.
+	 * OkHttp is only used for image fetches now. The catalog and
+	 * chapter HTML go through the WebView, so the call rate is
+	 * well below what the catalog used to need — 10 req/s is just
+	 * the same safety margin Tsuki's other Vietnamese parsers use.
 	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
@@ -108,30 +109,64 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Auth ==============================
 
 	/**
-	 * The site is gated by Cloudflare's "Under Attack" mode. Once
-	 * the user has cleared the challenge we look for *any* cookie
-	 * Cloudflare emits (`cf_*`, `_cf*`, `__cf*` — covered by
-	 * [CloudFlareHelper.isCloudFlareCookie]); the parser does not
-	 * care which exact variant cf_clearance comes back as, just that
-	 * the catalog stops returning 403. The chapter reader will
-	 * still fail loudly if the cookie is stale or has expired —
-	 * that surfaces as [AuthRequiredException] from [getPages] and
-	 * the app re-prompts the user to clear the challenge again.
+	 * Cloudflare sets `cf_clearance` (HttpOnly) once the user clears
+	 * the "Verify you are human" challenge in the in-app WebView. We
+	 * cannot read that cookie from `document.cookie` (it is HttpOnly)
+	 * and we cannot copy it into the OkHttp jar — so the cheapest
+	 * reliable signal that the user has authorized is a same-origin
+	 * `fetch()` through the WebView that returns 200.
+	 *
+	 * The OkHttp jar is still checked first because some reader apps
+	 * share a single `WebViewCookieJar` between WebView and OkHttp, in
+	 * which case the catalog probe succeeds without ever round-tripping
+	 * the WebView. A short TTL cache (10 s) sits in front of the
+	 * WebView probe so the app's frequent `isAuthorized()` polls do
+	 * not hammer it.
 	 */
 	override suspend fun isAuthorized(): Boolean {
+		// Fast path: shared cookie jar already carries cf_clearance.
 		val cookies = context.cookieJar.loadForRequest("https://$domain/".toHttpUrl())
-		return cookies.any { CloudFlareHelper.isCloudFlareCookie(it.name) }
+		if (cookies.any { CloudFlareHelper.isCloudFlareCookie(it.name) }) {
+			cachedAuthCheck = System.currentTimeMillis() to true
+			return true
+		}
+
+		val now = System.currentTimeMillis()
+		val cached = cachedAuthCheck
+		if (cached != null && now - cached.first < AUTH_CACHE_TTL_MS) {
+			return cached.second
+		}
+
+		val script = """
+			(async () => {
+				try {
+					const resp = await fetch('${baseUrl}', { credentials: 'include', cache: 'no-store' });
+					if (resp.status === 200 || resp.status === 301 || resp.status === 302) {
+						return 'OK';
+					}
+					if (resp.status === 403 || resp.status === 503) {
+						return 'CF';
+					}
+					return 'HTTP ' + resp.status;
+				} catch (e) {
+					return 'ERR: ' + (e && e.message ? e.message : String(e));
+				}
+			})()
+		""".trimIndent()
+		val raw = runCatching { context.evaluateJs(baseUrl, script) }.getOrNull()
+		val result = raw?.trim() == "OK"
+		cachedAuthCheck = now to result
+		return result
 	}
 
 	override suspend fun getUsername(): String? = null
 
 	/**
-	 * `SourceAuthActivity` opens this in the app's WebView so the
-	 * user can pass the Cloudflare "Verify you are human" /
-	 * Turnstile challenge. After that `cf_clearance` is in both the
-	 * WebView's `CookieManager` (needed for [PAGES_SCRIPT]'s
-	 * same-origin `fetch`) and the OkHttp jar (needed for the
-	 * catalog).
+	 * `SourceAuthActivity` opens this in the in-app WebView. The
+	 * user taps through the Cloudflare "Verify you are human"
+	 * challenge once; after that the WebView's `CookieManager`
+	 * carries `cf_clearance` and every subsequent `evaluateJs` fetch
+	 * (catalog, details, chapter) goes through.
 	 */
 	override val authUrl: String get() = baseUrl
 
@@ -157,7 +192,7 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val url = buildListUrl(page, order, filter)
-		val doc = fetchDocument(url)
+		val doc = fetchHtml(url)
 		return doc.select("div.grid div.relative").mapNotNull { div ->
 			val href = div.selectFirst("a[href^=/truyen/]")?.attrAsRelativeUrl("href")
 				?: return@mapNotNull null
@@ -188,7 +223,7 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Details ===============================
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val root = fetchDocument(manga.url.toAbsoluteUrl(domain))
+		val root = fetchHtml(manga.url.toAbsoluteUrl(domain))
 		val chapterDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.ROOT).apply {
 			timeZone = TimeZone.getTimeZone("GMT+7")
 		}
@@ -273,6 +308,11 @@ internal class LxManga(context: MangaLoaderContext) :
 			)
 		}
 
+		// The catalog probe succeeded in the WebView, so a previously
+		// negative auth check was just stale cookies. Drop the cache
+		// so the next call sees the fresh state.
+		cachedAuthCheck = null
+
 		return (0 until arr.length()).mapNotNull { i ->
 			val url = arr.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
 			MangaPage(
@@ -284,45 +324,10 @@ internal class LxManga(context: MangaLoaderContext) :
 		}
 	}
 
-	// ============================== Interceptor ===============================
-
-	/**
-	 * Cloudflare's image CDN at `s*.lxmanga.xyz` checks the
-	 * `Referer` / `Origin` against the live site. The OkHttp call to
-	 * the image URL has neither header by default, so the CDN
-	 * rejects the request as cross-origin even though the browser
-	 * would have sent them for an `<img>` request. Re-attach them
-	 * on every non-cover request too, for the cases where the
-	 * origin itself cares.
-	 */
-	override fun intercept(chain: Interceptor.Chain): Response {
-		val request = chain.request()
-		val url = request.url.toString()
-
-		val needsHeaders = !url.contains("covers")
-		val headers = if (needsHeaders) {
-			request.headers.newBuilder()
-				.add(CommonHeaders.REFERER, "$baseUrl/")
-				.add(CommonHeaders.ORIGIN, baseUrl)
-				.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_WINDOWS)
-				.build()
-		} else {
-			request.headers.newBuilder()
-				.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_WINDOWS)
-				.build()
-		}
-
-		val newRequest = request.newBuilder()
-			.headers(headers)
-			.build()
-
-		return chain.proceed(newRequest)
-	}
-
 	// ============================== Tags ===============================
 
 	private suspend fun loadAvailableTags(): Set<MangaTag> {
-		val doc = fetchDocument("https://$domain/the-loai")
+		val doc = fetchHtml("https://$domain/the-loai")
 		return doc.select("nav.grid.grid-cols-3.md\\:grid-cols-8 button").mapNotNull { button ->
 			val raw = button.attr("wire:click")
 			val key = raw.substringAfterLast(", '").substringBeforeLast("')")
@@ -396,26 +401,33 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/**
-	 * Fetch and parse one of the static HTML endpoints. The whole
-	 * site is Cloudflare-fronted, so any request can come back as
-	 * the "Just a moment…" challenge page; if it does, hand the URL
-	 * to [MangaLoaderContext.requestBrowserAction] which opens a
-	 * custom tab for the user to clear the challenge. After the
-	 * user comes back the OkHttp jar carries `cf_clearance` and the
-	 * next call goes through.
+	 * Fetch a static HTML page through the WebView. The WebView's
+	 * `CookieManager` already has `cf_clearance` (set when the user
+	 * confirmed the challenge through [authUrl]) and the same-origin
+	 * `fetch()` forwards it; the OkHttp jar does not get involved.
 	 *
-	 * [requestBrowserAction] is declared `Nothing` — it throws
-	 * (typically an [AuthRequiredException] the app surfaces to the
-	 * user) — so this function never returns when CF is detected.
+	 * If the user has not solved Cloudflare yet, the fetch returns
+	 * 403 "Just a moment…" — the script returns the literal
+	 * `"CF"` status which we convert into an
+	 * [AuthRequiredException] so the app re-prompts the user.
 	 */
-	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
-		val response = webClient.httpGet(url)
-		val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
-		if (protection != CloudFlareHelper.PROTECTION_NOT_DETECTED) {
-			response.close()
-			context.requestBrowserAction(this, url)
+	private suspend fun fetchHtml(url: String): Document {
+		val script = FETCH_HTML_SCRIPT.replace("__URL__", url)
+		val raw = runCatching { context.evaluateJs(url, script) }.getOrNull()
+		val trimmed = raw?.trim().orEmpty()
+		if (trimmed == "CF" || trimmed.startsWith("CF") || trimmed.startsWith("ERR:") || trimmed.isEmpty()) {
+			cachedAuthCheck = null
+			throw AuthRequiredException(
+				source,
+				IllegalStateException(
+					if (trimmed.startsWith("ERR:"))
+						"LXManga: không tải được trang (${trimmed.removePrefix("ERR:").trim()})"
+					else
+						"LXManga: chưa vượt qua Cloudflare — mở trang nguồn trong webview rồi thử lại",
+				),
+			)
 		}
-		return response.parseHtml()
+		return Jsoup.parse(trimmed, url)
 	}
 
 	private fun sortQuery(order: SortOrder): String = when (order) {
@@ -426,34 +438,73 @@ internal class LxManga(context: MangaLoaderContext) :
 		else -> "-updated_at"
 	}
 
+	@Volatile
+	private var cachedAuthCheck: Pair<Long, Boolean>? = null
+
 	companion object {
 		/**
-		 * The script run inside the chapter WebView. It mirrors what
-		 * the keiyoushi `runWebView` does, but compressed into a
-		 * single async IIFE because Tsuki only exposes one-shot
-		 * `evaluateJs(baseUrl, script)`.
+		 * How long the [isAuthorized] WebView probe stays cached.
+		 * The app polls `isAuthorized` on every state transition
+		 * (settings UI, retry after auth, etc.) and each probe is a
+		 * round-trip through the WebView — without this, a flurry of
+		 * settings-screen visits would re-issue the same `fetch()`
+		 * ten times in a row.
+		 */
+		private const val AUTH_CACHE_TTL_MS: Long = 10_000L
+
+		/**
+		 * The script the WebView runs to fetch one of the static
+		 * HTML pages (catalog, detail, tag listing). Returns the
+		 * raw HTML body as a string so the Kotlin side can run
+		 * Jsoup over it.
 		 *
-		 * The chapter URL itself is fetched with
-		 * `credentials: include` so the WebView's `cf_clearance`
-		 * cookie is forwarded. The fetched HTML is then dropped into
-		 * the stub document with `document.write` so every inline
-		 * `<script>` (including the ~600 kB obfuscated image-URL
-		 * builder) executes as if the user had loaded the chapter
-		 * page directly.
+		 * `__URL__` is replaced with the target URL by the caller
+		 * — the `evaluateJs(baseUrl, script)` call passes the same
+		 * URL as the baseUrl, so a same-origin `fetch()` is what
+		 * the WebView runs.
+		 */
+		private val FETCH_HTML_SCRIPT: String = """
+			(async () => {
+				try {
+					const resp = await fetch('__URL__', { credentials: 'include', cache: 'no-store' });
+					if (resp.status === 403 || resp.status === 503) {
+						return 'CF';
+					}
+					if (!resp.ok) {
+						return 'ERR: HTTP ' + resp.status;
+					}
+					return await resp.text();
+				} catch (e) {
+					return 'ERR: ' + (e && e.message ? e.message : String(e));
+				}
+			})()
+		""".trimIndent()
+
+		/**
+		 * The script the WebView runs to fetch the chapter page and
+		 * capture the obfuscated image-URL builder's output. Mirrors
+		 * the keiyoushi `runWebView` approach in a single async IIFE.
 		 *
-		 * The obfuscated script's final act is to populate
-		 * `window["_0x…"]` (a property name is randomised on every
-		 * page load) with the array of image URLs. We poll
-		 * `Object.keys(window)` for the first hex-prefixed property
-		 * whose value is a non-empty array of strings.
+		 * The chapter URL is fetched with `credentials: include` so
+		 * `cf_clearance` from the WebView's `CookieManager` is
+		 * forwarded. The fetched HTML is dropped into the stub
+		 * document with `document.write` so every inline `<script>`
+		 * (including the ~600 kB obfuscated image-URL builder)
+		 * executes as if the user had loaded the chapter page
+		 * directly. The builder's final act is to populate
+		 * `window["_0x…"]` (a property name randomised on every
+		 * page load) with the array of image URLs.
 		 *
+		 * We poll `Object.keys(window)` for the first hex-prefixed
+		 * property whose value is a non-empty array of strings.
 		 * Errors are returned as `"ERR:<message>"` so the Kotlin
 		 * side can distinguish them from a valid JSON array.
 		 */
 		private val PAGES_SCRIPT: String = """
 			(async () => {
 				try {
-					const resp = await fetch(location.href, { credentials: 'include' });
+					const resp = await fetch(location.href, { credentials: 'include', cache: 'no-store' });
+					if (resp.status === 403 || resp.status === 503) return 'CF';
 					if (!resp.ok) return 'ERR: HTTP ' + resp.status;
 					const html = await resp.text();
 					document.open();
