@@ -129,8 +129,16 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * written by the challenge WebView is visible here — that is why
 	 * this check works even though `document.cookie` would not show it.
 	 */
-	override suspend fun isAuthorized(): Boolean =
-		CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null
+	override suspend fun isAuthorized(): Boolean {
+		val authorized = runCatching {
+			CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null
+		}.getOrElse {
+			log("isAuthorized: cookie jar threw ${it::class.simpleName}: ${it.message}")
+			false
+		}
+		log("isAuthorized=$authorized jar=${jarName()} cookies=${cookieNames()}")
+		return authorized
+	}
 
 	/** No account system on this site, so there is no name to show. */
 	override suspend fun getUsername(): String? = null
@@ -265,8 +273,10 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		log("getPages $chapterUrl | jar=${jarName()} cookies=[${cookieNames()}]")
 		val raw = runCatching { context.evaluateJs(chapterUrl, PAGES_SCRIPT) }.getOrNull()
 		val trimmed = raw?.trim().orEmpty()
+		log("getPages js returned ${trimmed.length} chars: ${trimmed.take(120)}")
 		if (trimmed.isEmpty() || trimmed.startsWith("ERR:")) {
 			val reason = trimmed.removePrefix("ERR:").trim()
 			throw AuthRequiredException(
@@ -403,14 +413,29 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * that way).
 	 */
 	private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
+		log("GET $url | jar=${jarName()} cookies=[${cookieNames()}]")
 		val response = webClient.httpGet(url)
+		log("-> HTTP ${response.code} for $url")
 		val protection = CloudFlareHelper.checkResponseForProtection(response.copy())
 		if (protection != CloudFlareHelper.PROTECTION_NOT_DETECTED) {
+			log("!! unprotected response: CF protection=$protection — falling back to requestBrowserAction")
 			response.close()
 			context.requestBrowserAction(this, url)
 		}
 		return response.parseHtml()
 	}
+
+	// ============================== Diagnostics ===============================
+
+	private fun log(message: String) {
+		println("$LOG_TAG $message")
+	}
+
+	private fun jarName(): String = context.cookieJar.javaClass.simpleName
+
+	private fun cookieNames(): String = runCatching {
+		context.cookieJar.getCookies(domain).joinToString(",") { it.name }
+	}.getOrElse { "err:${it::class.simpleName}" }
 
 	private fun sortQuery(order: SortOrder): String = when (order) {
 		SortOrder.POPULARITY -> "-views"
@@ -421,6 +446,8 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	companion object {
+		private const val LOG_TAG = "[LxManga]"
+
 		/**
 		 * Script run inside the WebView to extract the chapter's
 		 * image URLs. Mirrors the keiyoushi `runWebView` approach
