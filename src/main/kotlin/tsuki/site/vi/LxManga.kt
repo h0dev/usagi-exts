@@ -140,11 +140,63 @@ internal class LxManga(context: MangaLoaderContext) :
 		source,
 	)
 
-	override fun getRequestHeaders(): Headers = Headers.Builder()
-		.add(CommonHeaders.REFERER, "https://$domain/")
-		.add(CommonHeaders.ORIGIN, "https://$domain")
-		.add(CommonHeaders.USER_AGENT, config[userAgentKey])
-		.build()
+	/**
+	 * Headers for every request we make — catalogue, details, and the
+	 * images the app loads with them.
+	 *
+	 * The interesting part is the browser identity. Cloudflare decides
+	 * whether a `cf_clearance` is valid for *this* client, and the
+	 * client it recorded when the challenge was solved was the app's
+	 * WebView. So we present exactly that identity: the WebView's user
+	 * agent (see [userAgentKey]) **plus** the client hints and
+	 * `Accept-Language` that go with it. A request that claims to be
+	 * Chrome on Android but sends no `Sec-Ch-Ua` at all is a mismatch
+	 * Cloudflare can see, and this parser used to send a desktop
+	 * Windows UA — the opposite of what the challenge screens use.
+	 *
+	 * `Sec-Fetch-*` deliberately stays out: its values depend on the
+	 * request type (a document navigation and an image differ), and a
+	 * wrong one would be worse than none.
+	 */
+	override fun getRequestHeaders(): Headers {
+		val userAgent = config[userAgentKey]
+		return Headers.Builder()
+			.add(CommonHeaders.REFERER, "https://$domain/")
+			.add(CommonHeaders.ORIGIN, "https://$domain")
+			.add(CommonHeaders.USER_AGENT, userAgent)
+			.add(CommonHeaders.ACCEPT_LANGUAGE, acceptLanguage())
+			.add(CommonHeaders.UPGRADE_INSECURE_REQUESTS, "1")
+			.apply { clientHints(userAgent)?.let { addAll(it) } }
+			.build()
+	}
+
+	/** e.g. `vi-VN,vi;q=0.9,en-US;q=0.8` — what the WebView would send. */
+	private fun acceptLanguage(): String = runCatching {
+		val tags = context.getPreferredLocales().take(3)
+			.map { it.toLanguageTag().ifEmpty { it.language } }
+			.distinct()
+		if (tags.isEmpty()) return@runCatching DEFAULT_ACCEPT_LANGUAGE
+		tags.mapIndexed { index, tag ->
+			when (index) {
+				0 -> tag
+				1 -> "$tag;q=0.9"
+				else -> "$tag;q=0.8"
+			}
+		}.joinToString(",")
+	}.getOrDefault(DEFAULT_ACCEPT_LANGUAGE)
+
+	/** Client hints matching [userAgent], as the WebView sends them. */
+	private fun clientHints(userAgent: String): Headers? {
+		val version = Regex("""Chrome/(\d+)""").find(userAgent)?.groupValues?.get(1) ?: return null
+		return Headers.Builder()
+			.add(CommonHeaders.SEC_CH_UA, "\"Chromium\";v=\"$version\", \"Not=A?Brand\";v=\"24\"")
+			.add(CommonHeaders.SEC_CH_UA_MOBILE, if (userAgent.contains("Mobile")) "?1" else "?0")
+			.add(
+				CommonHeaders.SEC_CH_UA_PLATFORM,
+				if (userAgent.contains("Android")) "\"Android\"" else "\"Linux\"",
+			)
+			.build()
+	}
 
 	// ============================== List ===============================
 
@@ -430,6 +482,8 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val LOG_TAG = "[LxManga]"
 
 		private const val ERROR_PREFIX = "ERR:"
+
+		private const val DEFAULT_ACCEPT_LANGUAGE = "vi-VN,vi;q=0.9,en;q=0.8"
 
 		/**
 		 * Extract the chapter's image URLs.
