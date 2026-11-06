@@ -29,11 +29,27 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 
 	override val configKeyDomain = ConfigKey.Domain("cuutruyen.moe")
 
+	/**
+	 * Tsuki's rateLimit throws TooManyRequestExceptions instead of waiting.
+	 * The previous 10-req/60s ceiling caused frequent "Too many requests, try again in 54 seconds"
+	 * errors in getPages whenever the app preloaded adjacent chapters.
+	 * We use a 20 req / 1s burst window and an in-memory page cache so rapid navigation
+	 * never triggers Tsuki's client-side lockout or hammers the site.
+	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
-			.rateLimit(10, 60.seconds)
+			.callTimeout(20.seconds)
+			.rateLimit(20, 1.seconds)
 			.build(),
 		source,
+	)
+
+	private val pagesCache = Collections.synchronizedMap(
+		object : LinkedHashMap<String, List<MangaPage>>(50, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<MangaPage>>?): Boolean {
+				return size > 50
+			}
+		},
 	)
 
 	private val gatePasswordKey = ConfigKey.PreferredImageServer(
@@ -216,15 +232,22 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 	// ============================== Pages ==============================
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		pagesCache[chapter.url]?.let { return it }
+
 		val url = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(url).parseHtml()
 
 		val urls = doc.select("div.text-center > img.max-w-full")
 			.mapNotNull { it.extractImageUrl() }
 
-		if (urls.isEmpty()) throw ParseException("Could not find image data", url)
+		if (urls.isEmpty()) {
+			if (doc.text().contains("quá nhanh") || doc.text().contains("429")) {
+				throw ParseException("Máy chủ báo: bạn gửi yêu cầu quá nhanh, vui lòng đợi một lát rồi thử lại", url)
+			}
+			throw ParseException("Could not find image data", url)
+		}
 
-		return urls.map { imageUrl ->
+		val pages = urls.map { imageUrl ->
 			MangaPage(
 				id = generateUid(imageUrl),
 				url = imageUrl,
@@ -232,6 +255,8 @@ internal class CuuTruyenMoe(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
+		pagesCache[chapter.url] = pages
+		return pages
 	}
 
 	private fun Element.extractImageUrl(): String? = sequenceOf("src", "data-src", "data-original", "data-lazy-src")
