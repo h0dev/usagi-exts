@@ -3,10 +3,13 @@ package tsuki.site.madara.vi
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONObject
 import org.jsoup.nodes.Element
 import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
 import tsuki.exception.ParseException
+import tsuki.config.ConfigKey
 import tsuki.model.ContentRating
 import tsuki.model.ContentType
 import tsuki.model.Manga
@@ -37,8 +40,9 @@ import java.util.UUID
 // Thằng nào làm web xứng đáng bị búng dái :p
 @MangaSourceParser("HENTAICUBE", "HentaiCube", "vi", ContentType.HENTAI)
 internal class HentaiCube(context: MangaLoaderContext) :
-	MadaraParser(context, MangaParserSource.HENTAICUBE, "hentaicube.xyz") {
+	MadaraParser(context, MangaParserSource.HENTAICUBE, "2tencb.pro") {
 
+	override val configKeyDomain = ConfigKey.Domain("2tencb.pro", "hentaicube.xyz")
 	override val datePattern = "dd/MM/yyyy"
 	override val authorSearchSupported = true
 	override val postDataReq = "action=manga_views&manga="
@@ -163,26 +167,52 @@ internal class HentaiCube(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val html = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val token = html.selectFirst(".manga-secure-reader")?.attr("data-masr2-token")
-			?: throw ParseException("Web đã thay đổi thuật toán mã hóa ảnh, hết cứu!", chapter.url)
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val html = webClient.httpGet(chapterUrl).parseHtml()
 
-		val headers = Headers.Builder()
-			.removeAll(CommonHeaders.REFERER)
-			.add(CommonHeaders.REFERER, chapter.url.toAbsoluteUrl(domain))
-			.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_MOBILE)
-			.build()
+		// New reader (v3): the site now exposes manga/chapter IDs and an API
+		// endpoint directly in the page.  It does not use masr2-token.
+		html.selectFirst(".msr-reader[data-msr-api]")?.let { reader ->
+			val mangaId = reader.attr("data-msr-manga").toIntOrNull()
+			val chapterId = reader.attr("data-msr-chapter").toIntOrNull()
+			if (mangaId != null && chapterId != null) {
+				val endpoint = reader.attr("data-msr-api").ifEmpty { "/wp-json/manga-reader/v3/" }
+				val pagesUrl = if (endpoint.startsWith("http")) {
+					endpoint.removeSuffix("/") + "/pages"
+				} else {
+					"https://$domain/${endpoint.trimStart('/').removeSuffix("/")}/pages"
+				}
+				val headers = readerHeaders(chapterUrl)
+				val body = JSONObject().put("manga", mangaId).put("chapter", chapterId)
+				val response = webClient.httpPost(pagesUrl.toHttpUrl(), body, headers)
+				if (response.code in 200..299) {
+					return response.parseJson().getJSONArray("items").asTypedList<String>().map {
+						MangaPage(generateUid(it), it, null, source)
+					}
+				}
+			}
+		}
 
+		// Legacy reader (v2), retained for old chapters/domains.
+		val token = html.selectFirst(".masr2-reader[data-masr2-token]")?.attr("data-masr2-token")
+			?: throw ParseException("Không tìm thấy API pages của HentaiCube", chapter.url)
 		val url = urlBuilder().addPathSegments("wp-json/manga-reader/v2/pages")
 			.addQueryParameter("token", token)
 			.addQueryParameter("cid", randomHash())
 			.build()
-
-		val json = webClient.httpGet(url, headers).parseJson()
+		val json = webClient.httpGet(url, readerHeaders(chapterUrl)).parseJson()
 		return json.getJSONArray("items").asTypedList<String>().map {
 			MangaPage(generateUid(it), it, null, source)
 		}
 	}
+
+	private fun readerHeaders(chapterUrl: String): Headers = Headers.Builder()
+		.add("Accept", "application/json")
+		.add("Content-Type", "application/json")
+		.add("X-MSR-Request", "1")
+		.add(CommonHeaders.REFERER, chapterUrl)
+		.add(CommonHeaders.USER_AGENT, UserAgents.CHROME_MOBILE)
+		.build()
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
