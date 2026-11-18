@@ -43,6 +43,20 @@ internal class HentaiCube(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.HENTAICUBE, "2tencb.pro") {
 
 	override val configKeyDomain = ConfigKey.Domain("2tencb.pro", "hentaicube.xyz")
+
+	// HentaiCube does not expose an account-login requirement to the reader.
+	// The inherited Madara auth hook otherwise checks for a WordPress cookie
+	// and makes Tsuki display "Đăng nhập" even when the reader only needs its
+	// own reader/Turnstile session.
+	override suspend fun isAuthorized(): Boolean = true
+
+	override suspend fun getUsername(): String {
+		val body = webClient.httpGet("https://$domain/").parseHtml().body()
+		return body.selectFirst(".c-user_name, .user-name, .username, .profile-name")?.text()?.trim()
+			?.takeIf { it.isNotEmpty() }
+			?: ""
+	}
+
 	override val datePattern = "dd/MM/yyyy"
 	override val authorSearchSupported = true
 	override val postDataReq = "action=manga_views&manga="
