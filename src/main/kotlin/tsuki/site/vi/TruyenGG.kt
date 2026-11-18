@@ -12,7 +12,7 @@ import java.util.*
 @MangaSourceParser("TRUYENGG", "FoxTruyen", "vi")
 internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context, MangaParserSource.TRUYENGG, 42) {
 
-	override val configKeyDomain = ConfigKey.Domain("foxtruyen2.com")
+	override val configKeyDomain = ConfigKey.Domain("truyenggvn.com", "foxtruyen.co.uk", "foxtruyen2.com")
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.NEWEST,
@@ -48,7 +48,7 @@ internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context,
 				buildString {
 					append("https://")
 					append(domain)
-					append("/tim-kiem/trang-$page.html")
+					append("/tim-kiem.html")
 					append("?q=")
 					append((filter.query.urlEncoded()))
 				}
@@ -117,17 +117,21 @@ internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context,
 		}
 
 		val doc = webClient.httpGet(url).parseHtml()
-		return doc.select(".list_item_home .item_home").map { div ->
-			val href = div.selectFirstOrThrow("a.book_name").attrAsRelativeUrl("href")
+		return doc.select(".list_grid_out > ul.list_grid > li").mapNotNull { item ->
+			val link = item.selectFirst(".book_name a") ?: return@mapNotNull null
+			val href = link.attrAsRelativeUrl("href")
 			Manga(
 				id = generateUid(href),
-				title = div.select("a.book_name").text(),
+				title = link.text(),
 				altTitles = emptySet(),
 				url = href,
 				publicUrl = href.toAbsoluteUrl(domain),
 				rating = RATING_UNKNOWN,
 				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
-				coverUrl = div.selectFirst(".image-cover img")?.attrAsAbsoluteUrlOrNull("data-src"),
+				coverUrl = item.selectFirst(".book_avatar img")?.let { img ->
+					img.attrAsAbsoluteUrlOrNull("data-src")
+						?: img.attrAsAbsoluteUrlOrNull("src")
+				},
 				tags = emptySet(),
 				state = null,
 				authors = emptySet(),
@@ -142,9 +146,9 @@ internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context,
 		val author = doc.select("p:contains(Tác Giả) + p").joinToString { it.text() }.nullIfEmpty()
 
 		return manga.copy(
-			altTitles = setOfNotNull(doc.selectFirst("h2.other-name")?.textOrNull()),
-			authors = setOfNotNull(author),
-			tags = doc.select("a.clblue").mapToSet {
+			altTitles = setOfNotNull(doc.selectFirst("h2.book-othername")?.textOrNull()),
+			authors = setOfNotNull(doc.selectFirst(".book-counts__value .org")?.textOrNull() ?: author),
+			tags = doc.select(".book-genres a").mapToSet {
 				MangaTag(
 					key = it.attr("href").substringAfterLast('-').substringBeforeLast('.'),
 					title = it.text().toTitleCase(sourceLocale),
@@ -152,16 +156,16 @@ internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context,
 				)
 			},
 			description = doc.select("div.story-detail-info").text(),
-			state = when (doc.select("p:contains(Trạng Thái) + p").text()) {
-				"Đang Cập Nhật" -> MangaState.ONGOING
-				"Hoàn Thành" -> MangaState.FINISHED
+			state = when {
+				doc.select(".book-counts__value").any { it.text().contains("Hoàn Thành", true) } -> MangaState.FINISHED
+				doc.select(".book-counts__value").any { it.text().contains("Đang Cập Nhật", true) } -> MangaState.ONGOING
 				else -> null
 			},
-			chapters = doc.select("ul.fx-chap-list > li.fx-chap-item").mapChapters(reversed = true) { i, div ->
-				val a = div.selectFirstOrThrow("a")
+			chapters = doc.select(".works-chapter-list .works-chapter-item").mapChapters(reversed = true) { i, div ->
+				val a = div.selectFirstOrThrow(".name-chap a")
 				val href = a.attrAsRelativeUrl("href")
 				val name = a.text()
-				val dateText = div.select("div.fx-chap-item__right > span.fx-chap-item__date").text()
+				val dateText = div.selectFirst(".time-chap")?.text()?.trim()
 				MangaChapter(
 					id = generateUid(href),
 					title = name,
@@ -180,8 +184,8 @@ internal class TruyenGG(context: MangaLoaderContext) : PagedMangaParser(context,
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
-		return doc.select(".content_detail img").map { img ->
-			val url = img.requireSrc()
+		return doc.select("#chapter_content .page-chapter img, .chapter_content .page-chapter img").map { img ->
+			val url = img.attr("data-original").ifBlank { img.attr("data-cdn") }.ifBlank { img.requireSrc() }
 			MangaPage(
 				id = generateUid(url),
 				url = url,
