@@ -1,5 +1,6 @@
 package tsuki.site.vi
 
+import okhttp3.Dispatcher
 import okhttp3.Interceptor
 import okhttp3.Response
 import tsuki.MangaLoaderContext
@@ -15,6 +16,7 @@ import org.jsoup.Jsoup
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
 import tsuki.util.*
+import tsuki.util.suspendlazy.suspendLazy
 import java.util.*
 import kotlin.math.pow
 import kotlin.time.Duration.Companion.seconds
@@ -25,9 +27,17 @@ internal class KuroNeko(context: MangaLoaderContext):
 
 	override val configKeyDomain = ConfigKey.Domain("vi-hentai.pro", "vi-hentai.moe")
 
+	// The site rate-limits aggressively. Keep one shared, serialized client
+	// for catalogue/details/pages instead of allowing preload requests to burst.
+	private val requestDispatcher = Dispatcher().apply {
+		maxRequests = 1
+		maxRequestsPerHost = 1
+	}
+
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
-			.rateLimit(10, 60.seconds)
+			.dispatcher(requestDispatcher)
+			.rateLimit(3, 60.seconds)
 			.build(),
 		source,
 	)
@@ -54,8 +64,10 @@ internal class KuroNeko(context: MangaLoaderContext):
 			isAuthorSearchSupported = true,
 		)
 
+	private val tagsCache = suspendLazy(initializer = ::fetchAvailableTags)
+
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = availableTags(),
+		availableTags = tagsCache.get(),
 		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
 	)
 
@@ -302,7 +314,7 @@ internal class KuroNeko(context: MangaLoaderContext):
 		return false
 	}
 
-	private suspend fun availableTags(): Set<MangaTag> {
+	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val doc = webClient.httpGet("https://$domain/tim-kiem").parseHtml()
 		val regex = Regex("toggleGenre\\('([0-9]+)'\\)")
 		return doc.select("div.grid.grid-cols-3 label").mapNotNullToSet { label ->
