@@ -193,8 +193,13 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      * `evaluateJs` from the activity.
      */
     override suspend fun isAuthorized(): Boolean {
-        log("isAuthorized: forced false (no evaluateJs from auth activity — see kdoc)")
-        return false
+        val now = System.currentTimeMillis()
+        cachedAuthCheck?.takeIf { now - it.first < authCacheTtlMs }?.let { return it.second }
+        val token = readWebViewAuthToken()
+        val authorized = !token.isNullOrBlank()
+        cachedAuthCheck = now to authorized
+        log("isAuthorized: token=${if (authorized) "present" else "missing"}")
+        return authorized
     }
 
     override suspend fun getUsername(): String? = null
@@ -411,9 +416,19 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     private suspend fun readWebViewAuthToken(): String? = runCatching {
         context.evaluateJs(
             baseUrl,
-            "(localStorage.getItem('auth_token') || localStorage.getItem('token') || '')",
+            """JSON.stringify({
+                ls: localStorage.getItem('auth_token') || localStorage.getItem('token') || '',
+                ck: document.cookie.match(/(?:^|; )access_token=([^;]+)/)?.[1] || ''
+            })""",
         )
-    }.getOrNull()?.trim()?.removeSurrounding("\"")?.takeIf { it.isNotBlank() }
+    }.getOrNull()?.let { raw ->
+        runCatching {
+            val obj = JSONObject(raw.trim().removeSurrounding("\""))
+            val ls = obj.optString("ls")
+            val ck = obj.optString("ck")
+            (ls.ifBlank { ck }).let { java.net.URLDecoder.decode(it, "UTF-8") }
+        }.getOrNull()
+    }?.takeIf { it.isNotBlank() }
 
     private suspend fun readRenderedChapter(pageUrl: String): List<String> {
         val script = """
