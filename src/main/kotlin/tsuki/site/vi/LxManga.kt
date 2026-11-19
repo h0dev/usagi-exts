@@ -310,6 +310,7 @@ internal class LxManga(context: MangaLoaderContext) :
 		}
 
 		val pages = try {
+			retryOnCsrf {
 			// The site answers HTTP 429 to bursts and states its own retry delay in
 			// `Retry-After`; Tsuki surfaces that as TooManyRequestExceptions. Waiting
 			// it out is the difference between "works" and "open the browser once per
@@ -344,6 +345,7 @@ internal class LxManga(context: MangaLoaderContext) :
 					MangaPage(generateUid(url), url, null, source)
 				}
 			}
+			}
 		} catch (_: VerificationRequiredException) {
 			context.requestBrowserAction(this, chapterUrl)
 		}
@@ -354,6 +356,21 @@ internal class LxManga(context: MangaLoaderContext) :
 		pageCache[chapterUrl] = pages
 		log("getPages: native ok ${chapterUrl.takeLast(40)} (${pages.size} pages)")
 		return pages
+	}
+
+	/** The CSRF token lives in the page, so a rotated one means: fetch the page again. */
+	private suspend fun <T> retryOnCsrf(block: suspend () -> T): T {
+		var attempt = 0
+		while (true) {
+			try {
+				return block()
+			} catch (e: CsrfExpiredException) {
+				attempt++
+				if (attempt >= 2) throw e
+				log("getPages: CSRF rotated, refetching the chapter page")
+				delay(300)
+			}
+		}
 	}
 
 	/** Wait out the site's own `Retry-After` instead of failing the chapter. */
@@ -523,6 +540,9 @@ internal class LxManga(context: MangaLoaderContext) :
 		val code = response.code
 		response.close()
 		log("get_token kid=${kid.take(8)} → HTTP $code ${body.take(120)}")
+		// Only 403 + require_verification means Turnstile. A 419 is an expired CSRF
+		// token and is fixed by fetching the chapter page again, not by a browser.
+		if (code == 419) throw CsrfExpiredException()
 		if (code !in 200..299) return null
 		val json = runCatching { JSONObject(body) }.getOrNull() ?: return null
 		if (json.optBoolean("is_bot", true)) return null
@@ -581,6 +601,8 @@ internal class LxManga(context: MangaLoaderContext) :
 	private fun randomId(): String = (1..7).map { ID_CHARS.random() }.joinToString("")
 
 	private class VerificationRequiredException : Exception()
+
+	private class CsrfExpiredException : IOException("CSRF hết hạn")
 
 	override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
 		val request = chain.request()
