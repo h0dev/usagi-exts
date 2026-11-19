@@ -1,6 +1,7 @@
 package tsuki.site.vi
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.IOException
@@ -11,6 +12,7 @@ import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
+import tsuki.exception.TooManyRequestExceptions
 import tsuki.model.*
 import tsuki.network.CloudFlareHelper
 import tsuki.network.CommonHeaders
@@ -305,11 +307,14 @@ internal class LxManga(context: MangaLoaderContext) :
 			log("getPages: cache hit ${chapterUrl.takeLast(40)} (${it.size} pages)")
 			return it
 		}
-		var lastError: Throwable? = null
 
-		repeat(2) { attempt ->
-			try {
-				val html = webClient.httpGet(chapterUrl).parseRaw()
+		val pages = try {
+			// The site answers HTTP 429 to bursts and states its own retry delay in
+			// `Retry-After`; Tsuki surfaces that as TooManyRequestExceptions. Waiting
+			// it out is the difference between "works" and "open the browser once per
+			// chapter", because opening a chapter costs 3 requests back to back.
+			withRetryOn429 {
+				val html = webClient.httpGet(chapterUrl, chapterDocumentHeaders()).parseRaw()
 				val manifestKey = extractManifestKey(html)
 					?: throw IOException("LXManga: không giải mã được khóa viewer")
 				val component = findViewerComponent(html)
@@ -325,30 +330,53 @@ internal class LxManga(context: MangaLoaderContext) :
 				val urls = fetchImageManifest(chapterUrl, csrf, component, actionToken, manifestKey)
 				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
 				val encodedToken = context.encodeBase64(actionToken.toByteArray())
-				val pages = urls.map { url ->
+				urls.map { url ->
 					val pageUrl = url.toHttpUrl().newBuilder()
 						.fragment("$TOKEN_MARKER$encodedToken")
 						.build()
 						.toString()
 					MangaPage(generateUid(url), pageUrl, null, source)
 				}
-				if (pageCache.size >= PAGE_CACHE_LIMIT) {
-					pageCache.remove(pageCache.keys.firstOrNull())
-				}
-				pageCache[chapterUrl] = pages
-				log("getPages: native ok ${chapterUrl.takeLast(40)} (${pages.size} pages)")
-				return pages
-			} catch (_: VerificationRequiredException) {
-				context.requestBrowserAction(this, chapterUrl)
-			} catch (e: CancellationException) {
-				throw e
-			} catch (e: Exception) {
-				lastError = e
-				log("getPages: attempt $attempt failed ${e.javaClass.simpleName}: ${e.message}")
+			}
+		} catch (_: VerificationRequiredException) {
+			context.requestBrowserAction(this, chapterUrl)
+		}
+
+		if (pageCache.size >= PAGE_CACHE_LIMIT) {
+			pageCache.remove(pageCache.keys.firstOrNull())
+		}
+		pageCache[chapterUrl] = pages
+		log("getPages: native ok ${chapterUrl.takeLast(40)} (${pages.size} pages)")
+		return pages
+	}
+
+	/** Wait out the site's own `Retry-After` instead of failing the chapter. */
+	private suspend fun <T> withRetryOn429(block: suspend () -> T): T {
+		var attempt = 0
+		while (true) {
+			try {
+				return block()
+			} catch (e: TooManyRequestExceptions) {
+				attempt++
+				val wait = e.retryAt?.let { at ->
+					java.time.Duration.between(java.time.Instant.now(), at).toMillis()
+				}?.let { if (it in 1L..15_000L) it + 250L else 1_500L } ?: 1_500L
+				log("getPages: HTTP 429 on ${e.url.takeLast(40)}, waiting ${wait}ms (try $attempt)")
+				if (attempt >= MAX_429_RETRIES) throw e
+				delay(wait)
 			}
 		}
-		throw lastError ?: IOException("LXManga: không tải được danh sách trang")
 	}
+
+	/** Browser-navigation headers for the chapter document itself. */
+	private fun chapterDocumentHeaders(): Headers = getRequestHeaders().newBuilder()
+		.set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		.set("Sec-Fetch-Dest", "document")
+		.set("Sec-Fetch-Mode", "navigate")
+		.set("Sec-Fetch-Site", "same-origin")
+		.set("Sec-Fetch-User", "?1")
+		.set("Cache-Control", "max-age=0")
+		.build()
 
 	private fun findViewerComponent(html: String): JSONObject? = WIRE_DATA_REGEX.findAll(html)
 		.mapNotNull { match ->
@@ -565,6 +593,7 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val TOKEN_MARKER = "LXMANGA_TOKEN="
 		private const val PAGE_CACHE_LIMIT = 50
 		private const val SESSION_COOKIE = "lxmanga_session"
+		private const val MAX_429_RETRIES = 5
 
 		private val pageCache = LinkedHashMap<String, List<MangaPage>>()
 
