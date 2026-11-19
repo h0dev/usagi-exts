@@ -2,6 +2,7 @@ package tsuki.site.vi
 
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import tsuki.MangaLoaderContext
@@ -23,6 +24,8 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.DAOMEODEN, 24) {
 
 	override val configKeyDomain = ConfigKey.Domain("daomeoden.net")
+
+	private val apiBaseUrl = "https://api.daomeoden.net"
 
 	/**
 	 * The site tolerates bursts but blocks sustained hammering. Tsuki's rateLimit
@@ -85,50 +88,25 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 	 * GET the shell, POST the form, parse the returned HTML fragment.
 	 */
 	private suspend fun fetchListPage(query: Map<String, String>): List<Manga> {
-		val listUrl = "https://$domain$LIST_PATH".toHttpUrl().newBuilder()
-			.apply { query.forEach { (k, v) -> addQueryParameter(k, v) } }
-			.build()
-			.toString()
-
-		val shell = webClient.httpGet(listUrl).parseHtml()
-		val html = shell.html()
-
-		val form = listOf(
-			"token", "pageCurrent", "pageLast", "status", "ages", "category",
-			"genre", "explicit", "magazine", "tags", "order", "pagiParam", "textSearch",
-		).associateWith { key ->
-			html.findScriptVariable(key) ?: DEFAULTS[key] ?: ""
+		val builder = "$apiBaseUrl/api/search/advanced".toHttpUrl().newBuilder()
+		query.forEach { (key, value) ->
+			when (key) {
+				"q" -> builder.addQueryParameter("q", value)
+				"genres" -> builder.addQueryParameter("genres", value)
+				else -> builder.addQueryParameter(key, value)
+			}
 		}
-
-		val payload = webClient.httpPost(
-			"https://$domain/apps/controllers/book/bookList.php".toHttpUrl(),
-			form,
-			apiHeaders(listUrl),
-		).parseJson()
-
-		val htmlBook = payload.optString("htmlBook").takeIf { it.isNotEmpty() }
-			?: return emptyList()
-
-		return Jsoup.parseBodyFragment(htmlBook, "https://$domain")
-			.select("div.item-list")
-			.map { element ->
-			val link = element.selectFirstOrThrow("div.item-title a")
-			val href = link.attrAsRelativeUrl("href")
-
+		val data = webClient.httpGet(builder.build(), apiHeaders("https://$domain/")).parseJson()
+			.optJSONArray("data") ?: return emptyList()
+		return (0 until data.length()).mapNotNull { index ->
+			val item = data.optJSONObject(index) ?: return@mapNotNull null
+			val href = item.optString("url").ifBlank { "/truyen-tranh/${item.optString("slug")}-${item.optInt("id")}" }
 			Manga(
-				id = generateUid(href),
-				title = link.text(),
-				altTitles = emptySet(),
-				url = href,
-				publicUrl = href.toAbsoluteUrl(domain),
-				rating = RATING_UNKNOWN,
-				contentRating = if (isNsfwSource) ContentRating.ADULT else null,
-				coverUrl = element.selectFirst("div.item-cover img")
-					?.attr("src")?.normalizeImageUrl(),
-				tags = emptySet(),
-				state = null,
-				authors = emptySet(),
-				source = source,
+				id = generateUid(href), title = item.optString("name").ifBlank { item.optString("title") },
+				altTitles = emptySet(), url = href, publicUrl = href.toAbsoluteUrl(domain),
+				rating = RATING_UNKNOWN, contentRating = if (item.optBoolean("is_adult")) ContentRating.ADULT else null,
+				coverUrl = item.optJSONObject("images")?.optString("cover_url").takeUnless { it.isNullOrBlank() },
+				tags = emptySet(), state = null, authors = emptySet(), source = source,
 			)
 		}
 	}
@@ -170,6 +148,22 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val url = manga.url.toAbsoluteUrl(domain)
+		val id = Regex("-(\\d+)$").find(manga.url.trimEnd('/'))?.groupValues?.get(1)?.toIntOrNull()
+		if (id != null) {
+			val item = webClient.httpGet("$apiBaseUrl/api/manga/$id", apiHeaders(url)).parseJson().optJSONObject("data")
+			if (item != null) {
+				val chapters = webClient.httpGet("$apiBaseUrl/api/manga/$id/chapters", apiHeaders(url)).parseJson()
+					.optJSONArray("data")?.let { array ->
+						(0 until array.length()).mapNotNull { i ->
+							val c = array.optJSONObject(i) ?: return@mapNotNull null
+							val chapterUrl = c.optString("url")
+							if (chapterUrl.isBlank()) return@mapNotNull null
+							MangaChapter(generateUid(chapterUrl), c.optString("title").ifBlank { "Chapter ${c.optDouble("number")}" }, c.optDouble("number").toFloat(), 0, chapterUrl, null, 0L, null, source)
+						}.sortedBy { it.number }
+					} ?: emptyList()
+				return manga.copy(title = item.optString("name").ifBlank { item.optString("title") }, description = item.optString("description"), chapters = chapters)
+			}
+		}
 		val doc = webClient.httpGet(url).parseHtml()
 
 		// The page token is stable for the whole session, so remembering it here
@@ -247,6 +241,13 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val url = chapter.url.toAbsoluteUrl(domain)
+		val apiChapterId = Regex("(?:chuong-|/)(\\d+)(?:-0)?\\.html$").find(chapter.url)?.groupValues?.get(1)?.toIntOrNull()
+		if (apiChapterId != null) {
+			val images = webClient.httpGet("$apiBaseUrl/api/chapters/$apiChapterId", apiHeaders(url)).parseJson()
+				.optJSONObject("data")?.optJSONArray("images")
+				?.let { array -> (0 until array.length()).map { array.getString(it) } }.orEmpty()
+			if (images.isNotEmpty()) return images.map { MangaPage(generateUid(it), it, null, source) }
+		}
 
 		// Chapter URLs look like /doc-truyen-tranh/<slug>/chuong-<n>-<chapterId>-0.html,
 		// so the chapter id and its manga slug can be read straight off the URL.
@@ -304,6 +305,12 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 	// ============================== Utils ==============================
 
 	private suspend fun availableGenres(): Set<MangaTag> {
+		val categories = webClient.httpGet("$apiBaseUrl/api/search/filters", apiHeaders("https://$domain/")).parseJson()
+			.optJSONObject("data")?.optJSONArray("categories")
+		if (categories != null) return (0 until categories.length()).mapNotNull {
+			val item = categories.optJSONObject(it) ?: return@mapNotNull null
+			MangaTag(item.optString("slug"), item.optString("name"), source)
+		}.toSet()
 		val doc = webClient.httpGet("https://$domain$LIST_PATH").parseHtml()
 		return doc.select("#filterGenre .filter-item[data-slug]")
 			.mapNotNullToSet { element ->
