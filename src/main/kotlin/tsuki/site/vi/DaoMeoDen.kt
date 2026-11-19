@@ -243,13 +243,16 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 		val url = chapter.url.toAbsoluteUrl(domain)
 		// New API chapter URLs are usually .../chuong-1-2126369-0
 		// (without .html). The API id is the second numeric component.
-		val apiChapterId = Regex("chuong-[\\d.]+-(\\d+)(?:-0)?(?:\\.html)?$")
-			.find(chapter.url.trimEnd('/'))?.groupValues?.get(1)?.toIntOrNull()
+		val chapterTail = chapter.url.substringAfterLast("chuong-", "")
+		val apiChapterId = chapterTail.split('-').getOrNull(1)?.toIntOrNull()
 		if (apiChapterId != null) {
 			val images = webClient.httpGet("$apiBaseUrl/api/chapters/$apiChapterId", apiHeaders(url)).parseJson()
 				.optJSONObject("data")?.optJSONArray("images")
 				?.let { array -> (0 until array.length()).map { array.getString(it) } }.orEmpty()
-			if (images.isNotEmpty()) return images.map { MangaPage(generateUid(it), it, null, source) }
+			if (images.isNotEmpty()) return images.map { image ->
+				val imageUrl = if (image.startsWith("/")) "https://dmd-image-content-sng-1.imggo.net$image" else image
+				MangaPage(generateUid(imageUrl), imageUrl, null, source)
+			}
 		}
 
 		// Chapter URLs look like /doc-truyen-tranh/<slug>/chuong-<n>-<chapterId>-0.html,
