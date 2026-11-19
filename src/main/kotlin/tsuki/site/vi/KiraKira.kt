@@ -9,6 +9,7 @@ import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
+import tsuki.exception.AuthRequiredException
 import tsuki.exception.ParseException
 import tsuki.model.ContentRating
 import tsuki.model.Manga
@@ -24,8 +25,8 @@ import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
 import tsuki.network.CommonHeaders
 import tsuki.network.OkHttpWebClient
+import tsuki.util.WebViewHelper
 import tsuki.util.generateUid
-import tsuki.util.getCookies
 import tsuki.util.json.getStringOrNull
 import tsuki.util.json.mapJSONNotNull
 import tsuki.util.json.mapJSONToSet
@@ -51,9 +52,8 @@ import kotlin.time.Duration.Companion.seconds
  * trick is fragile (it depends on the CDN returning 404 vs an opaque image
  * payload, which is not part of any contract) and not needed here: the app
  * surfaces `AuthRequiredException` through the standard "Đăng nhập" / "Mua
- * chương" UX, which is what the user actually wants. Paid chapters are flagged
- * with a lock prefix and a `?locked=1` marker in the chapter URL so the parser
- * refuses to fetch them without the user explicitly buying them on the site.
+ * chương" UX. Paid chapters keep the lock prefix as a hint, while the API makes
+ * the final decision so chapters already purchased by the current account work.
  */
 @MangaSourceParser("KIRAKIRA", "KiraKira", "vi")
 internal class KiraKira(context: MangaLoaderContext) :
@@ -82,34 +82,70 @@ internal class KiraKira(context: MangaLoaderContext) :
 	// ============================== Auth ==============================
 
 	/**
-	 * The site authenticates through Discord OAuth; the resulting session
-	 * cookie is `HttpOnly` on `truyenkira.net` and is sent to the API on
-	 * `api.truyenkira.net` via the standard `Domain` attribute. We can't
-	 * know the exact cookie name from the client (it is generated server
-	 * side), so the cheapest reliable signal is "is there *any* cookie for
-	 * this domain at all?" — the actual session validity is verified by
-	 * the API on each call and surfaces as a 401 in [getPages].
+	 * KiraKira is a token-based SPA. The current frontend stores the JWT as
+	 * `auth_token` in localStorage (or sessionStorage when "remember me" is
+	 * disabled) and sends it as `Authorization: Bearer …`; it does not use a
+	 * login cookie (`withCredentials` is false).
 	 */
-	override suspend fun isAuthorized(): Boolean =
-		context.cookieJar.getCookies(domain).isNotEmpty()
+	override suspend fun isAuthorized(): Boolean = currentToken() != null
 
-	override suspend fun getUsername(): String? = null
+	override suspend fun getUsername(): String? {
+		val token = currentToken() ?: return null
+		return runCatching {
+			val payload = webClient.httpGet("$API_HOST/users/me".toHttpUrl(), apiHeaders(token)).parseJson()
+			val data = payload.optJSONObject("data") ?: payload
+			data.getStringOrNull("username")
+				?: data.getStringOrNull("displayName")
+				?: data.getStringOrNull("name")
+		}.getOrNull()
+	}
 
-	/**
-	 * `SourceAuthActivity` opens this URL in a WebView so the user can sign
-	 * in through Discord. After OAuth completes the SPA sets the session
-	 * cookie, which is then picked up by the app's `CookieJar` and sent to
-	 * the API on subsequent requests.
-	 */
+	/** The SPA login route. Email/password and the configured OAuth providers live here. */
 	override val authUrl: String
-		get() = "https://$domain/auth/login"
+		get() = "https://$domain/login"
+
+	private suspend fun currentToken(): String? = when (readStorage(AUTH_REMEMBER_KEY, session = false)) {
+		"0" -> readStorage(AUTH_TOKEN_KEY, session = true)
+		"1" -> readStorage(AUTH_TOKEN_KEY, session = false)
+		else -> readStorage(AUTH_TOKEN_KEY, session = false)
+			?: readStorage(AUTH_TOKEN_KEY, session = true)
+	}
+
+	private suspend fun readStorage(key: String, session: Boolean): String? {
+		val raw = runCatching {
+			if (session) {
+				context.evaluateJs("https://$domain/", "sessionStorage.getItem(${JSONObject.quote(key)})")
+			} else {
+				WebViewHelper(context).getLocalStorageValue(domain, key)
+			}
+		}.getOrNull() ?: return null
+		return decodeJavascriptString(raw)
+	}
+
+	private fun decodeJavascriptString(raw: String): String? {
+		val value = raw.trim().let { encoded ->
+			if (encoded.startsWith('"') && encoded.endsWith('"')) {
+				runCatching { JSONObject("{\"v\":$encoded}").getString("v") }.getOrNull()
+			} else {
+				encoded
+			}
+		}?.trim()
+		return value?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
+	}
+
+	private fun apiHeaders(token: String? = null): Headers = Headers.Builder()
+		.add("Accept", "application/json")
+		.add(CommonHeaders.X_REQUESTED_WITH, "XMLHttpRequest")
+		.add(CommonHeaders.ORIGIN, "https://$domain")
+		.add(CommonHeaders.REFERER, "https://$domain/")
+		.apply { token?.let { add(CommonHeaders.AUTHORIZATION, "Bearer $it") } }
+		.build()
 
 	// ============================== List ===============================
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,    // default: most recently updated
-		SortOrder.POPULARITY, // sort=views
-		SortOrder.NEWEST,     // sort=new
+		SortOrder.POPULARITY, // trending feed
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
@@ -138,12 +174,11 @@ internal class KiraKira(context: MangaLoaderContext) :
 		return response.parseListManga()
 	}
 
-	private suspend fun fetchSearchPage(page: Int, query: String): JSONObject {
-		val url = "$API_HOST/search".toHttpUrl().newBuilder()
+	private suspend fun fetchSearchPage(page: Int, query: String): JSONObject = fetchMangaBatch(page) { apiPage ->
+		"$API_HOST/search".toHttpUrl().newBuilder()
 			.addQueryParameter("q", query)
-			.addQueryParameter("page", page.toString())
+			.addQueryParameter("page", apiPage.toString())
 			.build()
-		return webClient.httpGet(url).parseJson()
 	}
 
 	private suspend fun fetchBrowsePage(
@@ -151,6 +186,28 @@ internal class KiraKira(context: MangaLoaderContext) :
 		order: SortOrder,
 		filter: MangaListFilter,
 	): JSONObject {
+		// The mixed `/genres/all` feed is now overwhelmingly novels. KiraKira's
+		// dedicated feeds understand `type=manga` and preserve normal 20-item
+		// pagination, so use them whenever no genre filter is selected.
+		if (filter.tags.isEmpty()) {
+			val path = if (order == SortOrder.POPULARITY) "trending-comics" else "recent-update-comics"
+			val base = "$API_HOST/$path".toHttpUrl().newBuilder()
+				.addQueryParameter("type", "manga")
+				.apply {
+					filter.states.firstOrNull()?.let { state ->
+						addQueryParameter("status", when (state) {
+							MangaState.ONGOING -> "updating"
+							MangaState.FINISHED -> "completed"
+							else -> return@let
+						})
+					}
+				}
+				.build()
+			return fetchMangaBatch(page) { apiPage ->
+				base.newBuilder().addQueryParameter("page", apiPage.toString()).build()
+			}
+		}
+
 		// The endpoint is `/api/genres/<id>` where `<id>` matches the chosen
 		// genre (or "all"). The `type` query param is a redundant echo of the
 		// same id; sending both is what the web client does and keeps the
@@ -174,7 +231,49 @@ internal class KiraKira(context: MangaLoaderContext) :
 				}
 			}
 			.build()
-		return webClient.httpGet(url).parseJson()
+		return fetchMangaBatch(page) { apiPage ->
+			url.newBuilder().setQueryParameter("page", apiPage.toString()).build()
+		}
+	}
+
+	/**
+	 * Tsuki's paginator only sees the number of items returned after parsing,
+	 * while KiraKira mixes manga and novels in the same API pages. A page made
+	 * entirely of novels would otherwise look like end-of-list. Read ahead and
+	 * merge API pages until there is at least one manga, the server says the
+	 * catalog ended, or the bounded read-ahead is exhausted. The normal feeds
+	 * already use `type=manga`; the bound mainly protects unusual search and
+	 * genre results from making dozens of requests in one UI load.
+	 */
+	private suspend fun fetchMangaBatch(
+		startPage: Int,
+		urlForPage: (Int) -> HttpUrl,
+	): JSONObject {
+		val comics = org.json.JSONArray()
+		var apiPage = startPage
+		var totalPages = startPage
+		do {
+			val payload = webClient.httpGet(urlForPage(apiPage), apiHeaders()).parseJson()
+			totalPages = payload.optInt("total_pages", apiPage)
+			payload.optJSONArray("comics")?.let { pageItems ->
+				for (index in 0 until pageItems.length()) {
+					val item = pageItems.optJSONObject(index) ?: continue
+					if (!item.optString("type").equals("novel", ignoreCase = true)) {
+						comics.put(item)
+					}
+				}
+			}
+			apiPage++
+		} while (
+			comics.length() == 0 &&
+			apiPage <= totalPages &&
+			apiPage - startPage < MAX_EMPTY_PAGE_SCAN
+		)
+
+		return JSONObject()
+			.put("comics", comics)
+			.put("current_page", apiPage - 1)
+			.put("total_pages", totalPages)
 	}
 
 	/**
@@ -218,7 +317,7 @@ internal class KiraKira(context: MangaLoaderContext) :
 		val slug = manga.url.substringAfter("/comics/").substringBefore('?').trim('/')
 		if (slug.isBlank()) throw ParseException("Invalid manga url", manga.url)
 
-		val json = webClient.httpGet("$API_HOST/comics/$slug".toHttpUrl()).parseJson()
+		val json = webClient.httpGet("$API_HOST/comics/$slug".toHttpUrl(), apiHeaders()).parseJson()
 
 		val title = json.optString("title").ifBlank { manga.title }
 		val description = json.getStringOrNull("description")
@@ -251,10 +350,10 @@ internal class KiraKira(context: MangaLoaderContext) :
 
 			val number = regexChapterNumber.find(name)?.value?.toFloatOrNull() ?: 0f
 			val titleText = if (isLocked) "🔒 $name" else name
-			val url = buildString {
-				append("/chapters/$slug/$id")
-				if (isLocked) append("?locked=1")
-			}
+			// `coinPrice > 0` is only a display hint. It does not mean the current
+			// account has not bought the chapter, so never bake a blocking marker
+			// into the URL; the authenticated chapter endpoint is authoritative.
+			val url = "/chapters/$slug/$id"
 
 			MangaChapter(
 				id = generateUid(id),
@@ -284,20 +383,9 @@ internal class KiraKira(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val url = "https://$domain${chapter.url}".toHttpUrl()
-		if (url.queryParameter("locked") == "1") {
-			// The chapter is paywalled; the user has to purchase it on the
-			// site. We refuse to probe because the only way to obtain pages
-			// is a legitimate purchase and the API will reject any other
-			// attempt.
-			throw tsuki.exception.AuthRequiredException(
-				source,
-				Exception(LOCKED_CHAPTER_MESSAGE),
-			)
-		}
 
-		// Chapter URLs come in two shapes from the database:
-		//   /chapters/<slug>/<id>            (current)
-		//   /chapters/<slug>/<id>?locked=1   (already locked)
+		// A legacy database entry may still carry `?locked=1`; query parameters
+		// do not affect path parsing and no longer block a legitimately bought chapter.
 		val pathSegments = url.pathSegments
 		if (pathSegments.size < 3 || pathSegments[0] != "chapters") {
 			throw ParseException("Cannot parse chapter url", chapter.url)
@@ -311,19 +399,22 @@ internal class KiraKira(context: MangaLoaderContext) :
 		// `NotFoundException`. Letting those bubble up gives the app the
 		// right UX (login prompt vs. parse error) without us needing to
 		// inspect the status code manually.
-		val response = webClient.httpGet(apiUrl)
+		val token = currentToken()
+		val response = try {
+			webClient.httpGet(apiUrl, apiHeaders(token))
+		} catch (e: AuthRequiredException) {
+			throw AuthRequiredException(
+				source,
+				IllegalStateException(
+					if (token == null) "Chương trả phí — cần đăng nhập và mở khóa trên web"
+					else "Phiên đăng nhập đã hết hạn hoặc chương chưa được mở khóa",
+					e,
+				),
+			)
+		}
 
 		response.use {
 			val json = it.parseJson()
-			val coinPrice = json.optInt("coinPrice", 0)
-			val isPurchased = json.optBoolean("isPurchased", false)
-			if (coinPrice > 0 && !isPurchased) {
-				throw tsuki.exception.AuthRequiredException(
-					source,
-					Exception(LOCKED_CHAPTER_MESSAGE),
-				)
-			}
-
 			val images = json.optJSONArray("images") ?: throw ParseException(
 				"Empty chapter payload",
 				apiUrl.toString(),
@@ -356,7 +447,7 @@ internal class KiraKira(context: MangaLoaderContext) :
 	 */
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		val json = try {
-			webClient.httpGet("$API_HOST/genres".toHttpUrl()).parseJson()
+			webClient.httpGet("$API_HOST/genres".toHttpUrl(), apiHeaders()).parseJson()
 		} catch (_: Exception) {
 			return emptySet()
 		}
@@ -409,7 +500,9 @@ internal class KiraKira(context: MangaLoaderContext) :
 
 	private companion object {
 		const val API_HOST = "https://api.truyenkira.net"
-		const val LOCKED_CHAPTER_MESSAGE = "Chương này cần mua bằng xu trên trang web"
+		const val AUTH_TOKEN_KEY = "auth_token"
+		const val AUTH_REMEMBER_KEY = "auth_remember"
+		const val MAX_EMPTY_PAGE_SCAN = 8
 
 		val regexChapterNumber = Regex("""\d+(?:\.\d+)?""")
 
