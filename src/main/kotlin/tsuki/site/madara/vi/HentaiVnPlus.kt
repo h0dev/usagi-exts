@@ -1,5 +1,6 @@
 package tsuki.site.madara.vi
 
+import org.jsoup.Jsoup
 import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
@@ -84,11 +85,40 @@ internal class HentaiVnPlus(context: MangaLoaderContext) :
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-        return doc.select(".chapter_content img, .chapter_content_div img").mapNotNull { img ->
-            val url = img.attr("data-original").ifBlank { img.attr("src") }.trim()
-            if (url.isBlank()) null else MangaPage(generateUid(url), url, null, source)
+        val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+        val verifiedHtml = runCatching {
+            // HentaiVNReal uses a client-side Vietnamese-user gate. The gate
+            // only persists this expiry marker in Cookie/localStorage; seed it
+            // inside the site's WebView origin, then fetch the page with the
+            // same WebView cookie jar. This also handles HttpOnly/session
+            // state that the OkHttp client cannot see.
+            context.evaluateJs(chapterUrl, VERIFY_AND_FETCH_SCRIPT)
+        }.getOrNull()?.takeIf { it.contains("xem_anhtruyen") || it.contains("manga-images") }
+
+        val doc = if (verifiedHtml != null) {
+            Jsoup.parse(verifiedHtml, chapterUrl)
+        } else {
+            webClient.httpGet(chapterUrl).parseHtml()
         }
+        return doc.select("#image img, .xem_anhtruyen-0 img, .chapter_content img, .chapter_content_div img")
+            .mapNotNull { img ->
+                val url = img.attr("data-original").ifBlank { img.attr("src") }.trim()
+                if (url.isBlank()) null else MangaPage(generateUid(url), url, null, source)
+            }
+            .distinctBy { it.url }
+            .ifEmpty { throw IllegalStateException("Không tìm thấy ảnh chapter sau khi xác minh HentaiVN Real") }
+    }
+
+    private companion object {
+        private const val VERIFY_AND_FETCH_SCRIPT = """
+            (async () => {
+                const expiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
+                document.cookie = 'hvnr_vn_verify=' + expiry + '; path=/; max-age=2592000; SameSite=Lax';
+                try { localStorage.setItem('hvnr:vn-verify', String(expiry)); } catch (_) {}
+                const response = await fetch(location.href, { credentials: 'include', cache: 'no-store' });
+                return await response.text();
+            })()
+        """
     }
 
     private fun chapterNumber(title: String): Float =
