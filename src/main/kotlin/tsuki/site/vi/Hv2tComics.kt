@@ -196,9 +196,9 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         val now = System.currentTimeMillis()
         cachedAuthCheck?.takeIf { now - it.first < authCacheTtlMs }?.let { return it.second }
         val token = readWebViewAuthToken()
-        val authorized = !token.isNullOrBlank()
+        val authorized = !token.isNullOrBlank() || checkWebViewSession()
         cachedAuthCheck = now to authorized
-        log("isAuthorized: token=${if (authorized) "present" else "missing"}")
+        log("isAuthorized: token=${if (!token.isNullOrBlank()) "present" else "missing"}, session=$authorized")
         return authorized
     }
 
@@ -412,6 +412,14 @@ internal class Hv2tComics(context: MangaLoaderContext) :
             )
         }
     }
+
+    private suspend fun checkWebViewSession(): Boolean = runCatching {
+        val raw = context.evaluateJs(
+            baseUrl,
+            "fetch('/api/users/me', {credentials:'include'}).then(r => String(r.status)).catch(() => '0')",
+        )
+        raw?.trim() == "200"
+    }.getOrDefault(false)
 
     private suspend fun readWebViewAuthToken(): String? = runCatching {
         context.evaluateJs(
