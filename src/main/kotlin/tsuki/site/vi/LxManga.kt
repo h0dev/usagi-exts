@@ -331,6 +331,7 @@ internal class LxManga(context: MangaLoaderContext) :
 				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
 				val encodedToken = context.encodeBase64(actionToken.toByteArray())
 				urls.map { url ->
+					rememberToken(url, actionToken)
 					val pageUrl = url.toHttpUrl().newBuilder()
 						.fragment("$TOKEN_MARKER$encodedToken")
 						.build()
@@ -351,6 +352,14 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/** Wait out the site's own `Retry-After` instead of failing the chapter. */
+	/** Keeps a URL -> token map as a fallback when the page fragment is dropped. */
+	private fun rememberToken(url: String, token: String) {
+		if (imageTokens.size > TOKEN_MAP_LIMIT) {
+			imageTokens.clear()
+		}
+		imageTokens[url] = token
+	}
+
 	private suspend fun <T> withRetryOn429(block: suspend () -> T): T {
 		var attempt = 0
 		while (true) {
@@ -488,15 +497,24 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
 		val request = chain.request()
-		val fragment = request.url.fragment
-		if (fragment == null || !fragment.startsWith(TOKEN_MARKER)) {
+		val cleanUrl = request.url.newBuilder().fragment(null).build()
+		val marker = request.url.fragment?.takeIf { it.startsWith(TOKEN_MARKER) }
+
+		val token = marker?.let {
+			runCatching { String(context.decodeBase64(it.removePrefix(TOKEN_MARKER))) }.getOrNull()
+		} ?: imageTokens[cleanUrl.toString()] ?: imageTokens[request.url.toString()]
+
+		if (token == null) {
+			if (request.url.host.endsWith(CDN_SUFFIX)) {
+				log("intercept: no token for ${cleanUrl.toString().takeLast(48)}")
+			}
 			return chain.proceed(request)
 		}
-		val token = runCatching {
-			String(context.decodeBase64(fragment.removePrefix(TOKEN_MARKER)))
-		}.getOrNull() ?: return chain.proceed(request)
+		if (marker == null) {
+			log("intercept: token restored from map for ${cleanUrl.host}")
+		}
 		val updated = request.newBuilder()
-			.url(request.url.newBuilder().fragment(null).build())
+			.url(cleanUrl)
 			.header("Token", token.ifEmpty { "x" })
 			.header(CommonHeaders.REFERER, "https://$domain/")
 			.header(CommonHeaders.ORIGIN, "https://$domain")
@@ -594,6 +612,10 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val PAGE_CACHE_LIMIT = 50
 		private const val SESSION_COOKIE = "lxmanga_session"
 		private const val MAX_429_RETRIES = 5
+		private const val TOKEN_MAP_LIMIT = 400
+		private const val CDN_SUFFIX = "lxmanga.xyz"
+
+		private val imageTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
 
 		private val pageCache = LinkedHashMap<String, List<MangaPage>>()
 
