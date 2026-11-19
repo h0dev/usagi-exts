@@ -352,12 +352,27 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/** Wait out the site's own `Retry-After` instead of failing the chapter. */
+	/** `@lxmanga/<mangaId>/<chapterId>` — the part that identifies a chapter on the CDN. */
+	private fun chapterKeyToken(url: okhttp3.HttpUrl): String? {
+		val segments = url.pathSegments
+		if (segments.size < 4) return null
+		return chapterTokens["${segments[1]}/${segments[2]}"]
+	}
+
+	private fun rememberChapterToken(url: String, token: String) {
+		val parsed = runCatching { url.toHttpUrl() }.getOrNull() ?: return
+		val segments = parsed.pathSegments
+		if (segments.size < 4) return
+		chapterTokens["${segments[1]}/${segments[2]}"] = token
+	}
+
 	/** Keeps a URL -> token map as a fallback when the page fragment is dropped. */
 	private fun rememberToken(url: String, token: String) {
 		if (imageTokens.size > TOKEN_MAP_LIMIT) {
 			imageTokens.clear()
 		}
 		imageTokens[url] = token
+		rememberChapterToken(url, token)
 	}
 
 	private suspend fun <T> withRetryOn429(block: suspend () -> T): T {
@@ -502,7 +517,9 @@ internal class LxManga(context: MangaLoaderContext) :
 
 		val token = marker?.let {
 			runCatching { String(context.decodeBase64(it.removePrefix(TOKEN_MARKER))) }.getOrNull()
-		} ?: imageTokens[cleanUrl.toString()] ?: imageTokens[request.url.toString()]
+		} ?: imageTokens[cleanUrl.toString()]
+			?: imageTokens[request.url.toString()]
+			?: chapterKeyToken(cleanUrl)
 
 		if (token == null) {
 			if (request.url.host.endsWith(CDN_SUFFIX)) {
@@ -616,6 +633,7 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val CDN_SUFFIX = "lxmanga.xyz"
 
 		private val imageTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
+		private val chapterTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
 
 		private val pageCache = LinkedHashMap<String, List<MangaPage>>()
 
