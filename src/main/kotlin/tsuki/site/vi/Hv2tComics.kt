@@ -1,16 +1,20 @@
 package tsuki.site.vi
 
 import androidx.collection.arraySetOf
+import kotlinx.coroutines.delay
+import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
 import tsuki.exception.AuthRequiredException
+import tsuki.exception.NotFoundException
 import tsuki.model.*
 import tsuki.network.OkHttpWebClient
 import tsuki.util.generateUid
@@ -24,690 +28,522 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * HV2T Comics — https://hv2tcomics.net
  *
- * The site serves a Next.js SPA on top of a JSON API. The catalog
- * (`/api/comics`, `/api/comics/<slug>`, `/api/tags`, `/api/translators`) is
- * public but every request is gated by a Cloudflare Worker that demands an
- * `hv2t_adult_gate` cookie — without it the API returns
- * `{"code":"ADULT_GATE_REQUIRED"}` with HTTP 403.
+ * The site is a Next.js SPA over a JSON API under `/api`. Everything — the
+ * catalog (`/comics`, `/comics/<slug>`, `/tags`) and the chapter reader
+ * (`/comics/<comicKey>/<chapterSlug>/view`) — sits behind a Cloudflare
+ * Worker that demands an `hv2t_adult_gate` cookie; without it the API
+ * answers `403 {"code":"ADULT_GATE_REQUIRED"}`.
  *
- * The cookie has the form `v1.<unix_ts>.<sig>` and the signature is computed
- * server-side, so the parser cannot forge it. The first time the user opens
- * the source the app's auth WebView ([authUrl]) loads the homepage; the user
- * clicks "Tôi đã đủ 18 tuổi" and the cookie lands in the WebView's
- * CookieManager. The parser then reads it through `context.evaluateJs` and
- * copies it into the OkHttp cookie jar so the rest of the catalog works
- * without leaving the app.
+ * The gate cookie has the form `v1.<unix_ts>.<sig>` and the signature is
+ * computed server-side, so the parser cannot forge it: the app's auth
+ * WebView ([authUrl]) loads the sign-in page, the user confirms the gate
+ * (and signs in through Discord if they want to read), and both cookies
+ * land in the WebView's `CookieManager`. On Usagi the jar is
+ * `AndroidCookieJar`, which reads straight through `CookieManager`, so the
+ * very same cookies are already visible to [context]`​.cookieJar` and get
+ * attached to the OkHttp requests below. No `evaluateJs` round-trip is
+ * involved anywhere in this parser.
  *
- * Chapter pages are even more locked down: the SPA fetches a per-chapter
- * AES-GCM blob from `GET /api/comics/<mangaId>/<chapterId>/view`, then
- * decrypts it with a WASM module (`/security.wasm`) loaded at runtime. Both
- * the AES key and the IV timestamp are rotated per request. That endpoint
- * requires a signed-in session, so the auth WebView also doubles as a login
- * surface (the site supports Discord OAuth). Once the user is signed in, the
- * same `evaluateJs` trick wraps the whole flow: fetch the encrypted blob
- * using the WebView's session cookie, load the WASM with
- * `WebAssembly.instantiate`, decrypt in JavaScript, and return the JSON list
- * of image URLs.
+ * ## Chapter reader
  *
- * The keiyoushi reference parser does not need any of this because it gets a
- * real WebView with `runWebView` — Mihon/Tsuki only exposes the one-shot
- * `evaluateJs`, so we move both the cookie capture and the WASM decryption
- * inside the WebView's JavaScript context.
+ * `GET /api/comics/<comicKey>/<chapterSlug>/view` (requires a signed-in
+ * session — free chapters included) returns
  *
- * An idiosyncrasy of the catalog: the listing endpoint assigns its own
- * `id` field that does **not** match the numeric id returned by the
- * detail endpoint (e.g. listing `id:2` resolves to detail `id:623`). The
- * detail endpoint accepts the slug but only one of the two numeric ids
- * matches, so the parser always keys off the slug for catalog lookups and
- * the detail response's numeric id is only used for the chapter API.
+ * ```json
+ * {"success":true,
+ *  "data":"<base64 ciphertext>",
+ * "timestamp":1795059269930,
+ * "key":"hv2t-niga-93eb5c856909b900"}
+ * ```
+ *
+ * The payload is XOR-obfuscated with the ASCII bytes of `key` cycling over
+ * the ciphertext and the low 8 bytes of `timestamp`, shifted one bit per
+ * byte:
+ *
+ * ```
+ * plain[i] = cipher[i] xor ((timestamp ushr (i and 7)) and 0xff) xor key[i % key.length]
+ * ```
+ *
+ * That is exactly what the site's `/security.wasm` (`decrypt_buffer`) does
+ * — the module first checks the 9-byte key prefix `hv2t-niga` and does
+ * nothing otherwise — so no WASM runtime is needed on our side.
+ * [decryptChapterPayload] mirrors it byte for byte (verified against the
+ * real module on captured payloads, see the test harness).
+ *
+ * The decrypted JSON holds `images` (absolute CDN URLs, public — no cookie
+ * or referer needed), `media_revision`, `media_expires_at`, `info`,
+ * `comic` and `chapters_list`. When the CDN has not finished encoding a
+ * freshly uploaded chapter, `media_revision` is missing/invalid and the
+ * site retries with 250/750/1500 ms backoff; we do the same.
+ *
+ * ## Ids
+ *
+ * The catalog exposes two ids: the numeric detail id (`id`) and the public
+ * code (`public_code`, e.g. 131427). The reader route and the chapter API
+ * both key off the **public code** (or the slug); the numeric id answers
+ * `404 {"message":"Chương không tồn tại"}`. Chapters therefore store
+ * `<comicKey>/<chapterId>:<chapterSlug>` in [MangaChapter.url], where
+ * `comicKey` is the public code.
  */
 @MangaSourceParser("HV2TCOMICS", "HV2T Comics", "vi", type = ContentType.HENTAI)
 internal class Hv2tComics(context: MangaLoaderContext) :
-    PagedMangaParser(context, MangaParserSource.HV2TCOMICS, PAGE_SIZE), MangaParserAuthProvider {
+	PagedMangaParser(context, MangaParserSource.HV2TCOMICS, PAGE_SIZE), MangaParserAuthProvider {
 
-    override val configKeyDomain = ConfigKey.Domain(
-        "hv2tcomics.net",
-        "hv2tcomics.com",
-    )
+	override val configKeyDomain = ConfigKey.Domain(
+		"hv2tcomics.net",
+		"hv2tcomics.com",
+	)
 
-    /**
-     * Enable `println` tracing for the auth flow. Tags every line
-     * with `[Hv2tComics]` so it stands out in `adb logcat` (where
-     * the app's `System.out` lands as the `System.out` tag). Turn
-     * off if the log gets noisy in normal use.
-     */
-    private val debugLog = true
-    private val logTag = "[Hv2tComics]"
-    private fun log(message: String) {
-        if (debugLog) println("$logTag $message")
-    }
+	/** `println` tracing is tagged so it is easy to grep in `adb logcat`. */
+	private val debugLog = true
+	private val logTag = "[Hv2tComics]"
+	private fun log(message: String) {
+		if (debugLog) println("$logTag $message")
+	}
 
-    /**
-     * How long the answer to [isAuthorized] stays cached. The
-     * SourceAuthActivity re-asks on every `onPageFinished` —
-     * including the multiple intermediate hops of a Discord OAuth
-     * flow — and each answer that falls through the cache triggers
-     * a full [evaluateJs] round-trip (which on the shipped
-     * `WebViewExecutor` replaces the WebView content and allocates
-     * a fresh empty page). 30 s is long enough to cover a typical
-     * Discord OAuth round-trip and short enough that the source
-     * settings UI doesn't feel stale for long after the user logs
-     * in.
-     */
-    private val authCacheTtlMs = 30_000L
+	override val userAgentKey = ConfigKey.UserAgent(
+		"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.46 Mobile Safari/537.36",
+	)
 
-    @Volatile
-    private var cachedAuthCheck: Pair<Long, Boolean>? = null
+	private val baseUrl: String get() = "https://$domain"
 
-    override val userAgentKey = ConfigKey.UserAgent(
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.46 Mobile Safari/537.36",
-    )
+	override val webClient = OkHttpWebClient(
+		context.httpClient.newBuilder()
+			.rateLimit(30, 1.seconds)
+			.callTimeout(20.seconds)
+			.build(),
+		source,
+	)
 
-    private val baseUrl: String get() = "https://$domain"
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+		SortOrder.UPDATED,   // site: latest
+		SortOrder.POPULARITY,
+	)
 
-    /**
-     * Keiyoushi uses 3 req/s; Tsuki's rate-limit throws instead of waiting,
-     * so we mirror the wider DaoMeoDen window of 30 req/s — opening a manga
-     * costs 2 requests (list, detail) and a typical page browse is well
-     * within that.
-     */
-    override val webClient = OkHttpWebClient(
-        context.httpClient.newBuilder()
-            .rateLimit(30, 1.seconds)
-            .callTimeout(20.seconds)
-            .build(),
-        source,
-    )
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = MangaListFilterCapabilities(
+			isSearchSupported = true,
+			isMultipleTagsSupported = true,
+			isTagsExclusionSupported = true,
+			isSearchWithFiltersSupported = true,
+		)
 
-    override val availableSortOrders: Set<SortOrder> = EnumSet.of(
-        SortOrder.UPDATED,   // site: latest
-        SortOrder.POPULARITY,
-    )
+	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
+		availableTags = loadTags(),
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
+	)
 
-    override val filterCapabilities: MangaListFilterCapabilities
-        get() = MangaListFilterCapabilities(
-            isSearchSupported = true,
-            isMultipleTagsSupported = true,
-            isTagsExclusionSupported = true,
-            isSearchWithFiltersSupported = true,
-        )
+	// region auth
 
-    override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
-        availableTags = loadTags(),
-        availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
-    )
+	/**
+	 * What the app's `SourceAuthActivity` opens. It is the first screen that
+	 * both asks for the age gate and offers "Đăng nhập với Discord", so a
+	 * single visit is enough to make every call below work.
+	 */
+	override val authUrl: String get() = "$baseUrl/auth/login"
 
-    // region auth
+	/**
+	 * True as soon as the jar holds a non-blank `access_token`.
+	 *
+	 * Reading the jar is free (no request, no WebView), so this is safe to
+	 * call from every `onPageFinished` of the auth activity — which is why
+	 * the result is not cached: the activity fires it several times during
+	 * the Discord OAuth redirects and a TTL would only add staleness.
+	 */
+	override suspend fun isAuthorized(): Boolean {
+		val token = context.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
+			.firstOrNull { it.name == ACCESS_TOKEN_COOKIE && it.value.isNotBlank() }
+		log("isAuthorized: access_token=${token?.let { "present(${it.value.length})" } ?: "missing"}")
+		return token != null
+	}
 
-    /**
-     * `authUrl` is what the app's SourceAuthActivity opens: the user lands
-     * on the homepage, clicks the age-gate confirm button, and (if the
-     * chapter they want to read is paid) signs in through Discord OAuth.
-     * The cookies/state are then read back via `context.evaluateJs` in
-     * [isAuthorized] / [readDecryptedChapter].
-     */
-    /**
-     * `authUrl` is what the app's SourceAuthActivity opens. We point
-     * it straight at the sign-in page so that after the user clears
-     * the age-gate, they land on a screen with a clear
-     * "Đăng nhập với Discord" button. The user can then either:
-     *
-     *  - tap the Discord button to log in (full access), or
-     *  - hit Back / the up arrow to dismiss the activity, in which
-     *    case [isAuthorized] still returns `false` (no session) so
-     *    the app keeps the "Đăng nhập" row enabled and the user can
-     *    browse the catalog (list / search / details) without ever
-     *    creating an account. Free and VIP chapters will then 401 in
-     *    [getPages] and the app's exception resolver opens this
-     *    same activity again, so the user can log in later from
-     *    there.
-     */
-    override val authUrl: String get() = "$baseUrl/auth/login"
+	/** Shown in the source settings row, so the user can see who is signed in. */
+	override suspend fun getUsername(): String? = runCatching {
+		val payload = webClient.httpGet(apiUrl("users/me")).parseJson()
+		payload.optJSONObject("data")?.optString("username")?.takeIf { it.isNotBlank() }
+	}.getOrNull()
 
-    /**
-     * The previous implementation called [checkSessionCookie] on every
-     * uncached `isAuthorized`, which in turn ran `evaluateJs`. The
-     * app's `WebViewExecutor` wraps every `evaluateJs` in a
-     * `loadDataWithBaseURL` + `evaluateJavascript` + `webView.reset()`
-     * round-trip, and `reset()` only loads a fresh empty document —
-     * it does **not** release the previously-loaded page from
-     * memory. Chromium keeps the old DOM, JavaScript context, image
-     * cache, and WebGL textures alive in the WebView's heap until GC
-     * decides to collect them, which on this site (Cloudflare
-     * challenge with WebGL/canvas fingerprinting, plus the Discord
-     * OAuth flow) means a heavy 50–100 MB page lingers while the
-     * parser asks the WebView to do another probe — and the user
-     * log shows the heap climbing past 300 MB within a few seconds.
-     *
-     * Rather than play whack-a-mole with the cache TTL, drop the
-     * WebView probe entirely from `isAuthorized`. The
-     * SourceAuthActivity will stay open after the user finishes the
-     * Discord flow; the user dismisses it with the system back
-     * button. Login state is then picked up the first time the user
-     * actually opens a chapter: [getPages] runs the full decrypt
-     * round-trip (which we cannot avoid — there is no other way to
-     * fetch chapter images) and on success promotes the cached
-     * `isAuthorized` to `true`, so the next time anything asks
-     * (e.g. after dismissing the activity, when the source settings
-     * re-checks) the answer is correct without any further
-     * `evaluateJs` from the activity.
-     */
-    override suspend fun isAuthorized(): Boolean {
-        val cookies = context.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
-        val authorized = cookies.any { it.name == "access_token" && it.value.isNotBlank() }
-        log("isAuthorized: cookie access_token=${if (authorized) "present" else "missing"}")
-        return authorized
-    }
+	/** Throws the "open the auth WebView" signal while the gate cookie is missing. */
+	private fun requireAgeGate() {
+		if (context.cookieJar.getCookies(domain).any { it.name == ADULT_GATE_COOKIE }) return
+		throw AuthRequiredException(
+			source,
+			IllegalStateException("Cần xác nhận đủ 18 tuổi (và đăng nhập) trong webview của nguồn"),
+		)
+	}
 
-    override suspend fun getUsername(): String? = null
+	// endregion
 
-    private fun hasAgeGateCookie(): Boolean =
-        context.cookieJar.getCookies(domain).any { it.name == ADULT_GATE_COOKIE }
+	// region catalog
 
-    private suspend fun ensureAgeGateCookie(): Boolean {
-        if (hasAgeGateCookie()) return true
-        // The SourceAuthActivity has already loaded authUrl (the sign-in
-        // page) by the time `isAuthorized()` is called, so the
-        // WebView's cookie store has the gate cookie set in case the
-        // user already went through the confirm step.
-        // readDocumentCookie() returns null while the page is still on
-        // `about:blank` (the very first call), which is also the point
-        // where the user has not opened the source yet — treat that
-        // as "not authorized" so the sign-in row stays enabled.
-        val raw = readDocumentCookie() ?: return false
-        val match = ADULT_GATE_REGEX.find(raw) ?: return false
-        val value = match.groupValues[1]
-        if (value.isBlank()) return false
-        context.cookieJar.insertCookies(domain, "$ADULT_GATE_COOKIE=$value")
-        // The age-gate just flipped, so the previously cached
-        // `isAuthorized` (from a stale install or a previous sign-in
-        // attempt) is no longer accurate. Drop it so the very next
-        // call goes through checkSessionCookie and refreshes state.
-        cachedAuthCheck = null
-        return true
-    }
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		requireAgeGate()
+		val url = apiUrl("comics").newBuilder().apply {
+			addQueryParameter("page", page.toString())
+			addQueryParameter("sort", if (order == SortOrder.POPULARITY) "popular" else "latest")
+			filter.query?.takeIf { it.isNotBlank() }?.let { addQueryParameter("q", it) }
+			if (filter.tags.isNotEmpty()) {
+				addQueryParameter("tags_inc", filter.tags.joinToString(",") { it.key })
+			}
+			if (filter.tagsExclude.isNotEmpty()) {
+				addQueryParameter("tags_exc", filter.tagsExclude.joinToString(",") { it.key })
+			}
+		}.build()
 
-    /**
-     * Drops the cached [isAuthorized] answer. Production code does
-     * not need this — the 30 s TTL in [authCacheTtlMs] handles
-     * staleness — but tests can call it between scenarios so they
-     * can drive the auth flow without having to sleep past the TTL.
-     */
-    fun clearAuthCache() {
-        cachedAuthCheck = null
-    }
+		val payload = webClient.httpGet(url).parseJson()
+		if (payload.optBoolean("success") != true) {
+			return emptyList()
+		}
+		val items = payload.optJSONArray("data") ?: return emptyList()
+		return (0 until items.length()).mapNotNull { index ->
+			items.optJSONObject(index)?.toManga()
+		}
+	}
 
-    private suspend fun readDocumentCookie(): String? = runCatching {
-        context.evaluateJs("$baseUrl/", "document.cookie")
-    }.onSuccess { log("readDocumentCookie: ${it?.take(80)}") }.getOrNull()
+	override suspend fun getDetails(manga: Manga): Manga {
+		requireAgeGate()
+		// The detail endpoint accepts the slug (and the public code); listing
+		// ids do not match, so [Manga.url] holds the slug.
+		val payload = webClient.httpGet(apiUrl("comics/${manga.url}")).parseJson()
+		if (payload.optBoolean("success") != true) {
+			return manga
+		}
+		val data = payload.optJSONObject("data") ?: return manga
 
-    /**
-     * Hits the SPA's own session probe (`/api/users/me`) from inside the
-     * WebView so the request picks up the session cookie that the
-     * Discord OAuth flow drops into the WebView's CookieManager. We
-     * cannot make this call through `webClient` because the OkHttp
-     * cookie jar only sees the age-gate cookie we injected above.
-     *
-     * `evaluateJs(baseUrl, script)` sets the origin to the site's
-     * base URL and runs the script in a stub document. The
-     * `loadDataWithBaseURL` call also gives the WebView a moment on
-     * an empty `hv2tcomics.net` document — which is **lighter** than
-     * the live Cloudflare / Discord OAuth page the user has been
-     * staring at, so the heap doesn't keep climbing while the
-     * 30-second cache window is in effect.
-     */
-    private suspend fun checkSessionCookie(): Boolean {
-        val raw = runCatching {
-            context.evaluateJs(
-                "$baseUrl/",
-                "fetch('/api/users/me', { credentials: 'include' })" +
-                    ".then(r => r.status).catch(e => 0)",
-            )
-        }.getOrNull() ?: return false
-        return raw.trim() == "200"
-    }
+		val updated = data.toManga() ?: return manga
+		return manga.copy(
+			title = updated.title,
+			coverUrl = updated.coverUrl ?: manga.coverUrl,
+			description = updated.description ?: manga.description,
+			tags = updated.tags + manga.tags,
+			state = updated.state ?: manga.state,
+			authors = updated.authors.takeIf { it.isNotEmpty() } ?: manga.authors,
+			chapters = data.chapterList(comicKeyOf(data)),
+		)
+	}
 
-    // endregion
+	override suspend fun resolveLink(link: HttpUrl): Manga? {
+		requireAgeGate()
+		val segments = link.pathSegments
+		val key = segments.getOrNull(1)?.takeIf { it.isNotBlank() } ?: return null
+		return runCatching {
+			val payload = webClient.httpGet(apiUrl("comics/$key")).parseJson()
+			if (payload.optBoolean("success") != true) return@runCatching null
+			payload.optJSONObject("data")?.toManga()
+		}.getOrNull()
+	}
 
-    // region catalog
+	private suspend fun loadTags(): Set<MangaTag> = runCatching {
+		requireAgeGate()
+		val payload = webClient.httpGet(apiUrl("tags")).parseJson()
+		if (payload.optBoolean("success") != true) return@runCatching emptySet()
+		val arr = payload.optJSONArray("data") ?: return@runCatching emptySet()
+		(0 until arr.length()).mapNotNullTo(arraySetOf<MangaTag>()) { idx ->
+			val obj = arr.optJSONObject(idx) ?: return@mapNotNullTo null
+			val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
+			val name = obj.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
+			MangaTag(title = name, key = slug, source = source)
+		}
+	}.getOrDefault(emptySet())
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        ensureAgeGateCookie()
-        val url = apiUrl("comics").newBuilder().apply {
-            addQueryParameter("page", page.toString())
-            addQueryParameter("sort", if (order == SortOrder.POPULARITY) "popular" else "latest")
-            filter.query?.takeIf { it.isNotBlank() }?.let { addQueryParameter("q", it) }
-            if (filter.tags.isNotEmpty()) {
-                addQueryParameter("tags_inc", filter.tags.joinToString(",") { it.key })
-            }
-            if (filter.tagsExclude.isNotEmpty()) {
-                addQueryParameter("tags_exc", filter.tagsExclude.joinToString(",") { it.key })
-            }
-        }.build()
+	// endregion
 
-        val payload = webClient.httpGet(url).parseJson()
-        if (payload.optBoolean("success") != true) {
-            return emptyList()
-        }
-        val items = payload.optJSONArray("data") ?: return emptyList()
-        return (0 until items.length()).mapNotNull { index ->
-            items.optJSONObject(index)?.toManga()
-        }
-    }
+	// region pages
 
-    override suspend fun getDetails(manga: Manga): Manga {
-        ensureAgeGateCookie()
-        // The catalog detail endpoint accepts the slug (and certain
-        // numeric ids, but the listing ids do not match — see the class
-        // kdoc). We stored the slug as the parser's `Manga.url`, so
-        // pass it through unchanged.
-        val payload = webClient.httpGet(apiUrl("comics/${manga.url}")).parseJson()
-        if (payload.optBoolean("success") != true) {
-            return manga
-        }
-        val data = payload.optJSONObject("data") ?: return manga
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		requireAgeGate()
+		val ref = parseChapterUrl(chapter.url)
+		val lockedHint = chapter.title?.startsWith(LOCK_PREFIX) == true
+		val manifest = fetchManifest(ref, lockedHint)
+		val images = manifest.optJSONArray("images") ?: JSONArray()
+		log("getPages: ${ref.comicKey}/${ref.chapterSlug} -> ${images.length()} ảnh")
+		if (images.length() == 0) {
+			throw IllegalStateException("Chương không có ảnh nào (media_revision=${manifest.optString("media_revision")})")
+		}
+		return (0 until images.length()).mapNotNull { index ->
+			val url = images.optString(index).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			MangaPage(
+				id = generateUid(url),
+				url = if (url.startsWith("http")) url else "$baseUrl$url",
+				preview = null,
+				source = source,
+			)
+		}
+	}
 
-        val updated = data.toManga() ?: return manga.copy(chapters = data.chapterList(mangaId = data.optLong("id", 0L)))
-        val chapters = data.chapterList(mangaId = updated.id)
-        return manga.copy(
-            title = updated.title,
-            coverUrl = updated.coverUrl ?: manga.coverUrl,
-            description = updated.description ?: manga.description,
-            tags = updated.tags + manga.tags,
-            state = updated.state ?: manga.state,
-            authors = updated.authors.takeIf { it.isNotEmpty() } ?: manga.authors,
-            chapters = chapters,
-        )
-    }
+	/**
+	 * Fetch and decrypt the chapter manifest, retrying the cases the site
+	 * itself retries (fresh chapters whose CDN media is still being encoded,
+	 * 5xx and network hiccups) with the same 250/750/1500 ms backoff.
+	 *
+	 * 401 becomes [AuthRequiredException] straight from `ensureSuccess`;
+	 * 403 and 404 are turned into readable errors — a 403 is either a paid
+	 * chapter the session has not unlocked or a rejected session, and both
+	 * are fixed from the auth WebView.
+	 */
+	private suspend fun fetchManifest(ref: ChapterRef, lockedHint: Boolean): JSONObject {
+		val path = "comics/${ref.comicKey}/${ref.chapterSlug}/view"
+		val headers = Headers.Builder()
+			.add("Accept", "application/json, text/plain, */*")
+			.add("Referer", "$baseUrl/truyen/${ref.comicKey}/${ref.chapterSlug}")
+			.build()
 
-    override suspend fun resolveLink(link: HttpUrl): Manga? {
-        ensureAgeGateCookie()
-        val segments = link.pathSegments
-        val slug = segments.getOrNull(1)?.takeIf { it.isNotBlank() } ?: return null
-        return runCatching {
-            val payload = webClient.httpGet(apiUrl("comics/$slug")).parseJson()
-            if (payload.optBoolean("success") != true) return@runCatching null
-            payload.optJSONObject("data")?.toManga()
-        }.getOrNull()
-    }
+		var lastError: Throwable? = null
+		for (pause in RETRY_PAUSES_MS) {
+			if (pause > 0) delay(pause)
+			try {
+				val payload = webClient.httpGet(apiUrl(path), headers).parseJson()
+				if (payload.optBoolean("success") != true) {
+					val message = payload.optString("message")
+					if (payload.optString("code") == "ADULT_GATE_REQUIRED") {
+						throw AuthRequiredException(source, IllegalStateException(message))
+					}
+					lastError = IllegalStateException(message.ifBlank { "API trả về success=false" })
+					continue
+				}
+				val manifest = decryptManifest(payload)
+				if (manifest == null) {
+					lastError = IllegalStateException("Manifest chưa sẵn sàng (media_revision)")
+					continue
+				}
+				return manifest
+			} catch (e: AuthRequiredException) {
+				throw e
+			} catch (e: NotFoundException) {
+				throw IllegalStateException("Không tìm thấy chương ${ref.chapterSlug} (404)", e)
+			} catch (e: HttpStatusException) {
+				when (e.statusCode) {
+					403 -> throw AuthRequiredException(
+						source,
+						IllegalStateException(
+							if (lockedHint) "Chương trả phí — cần đăng nhập và mở khoá trên web"
+							else "Truy cập bị từ chối (403) — đăng nhập lại trong webview",
+						),
+					)
+					in RETRYABLE_STATUS -> lastError = e
+					else -> throw IllegalStateException("HTTP ${e.statusCode} khi đọc chương", e)
+				}
+			} catch (e: Exception) {
+				lastError = e
+			}
+		}
+		throw IllegalStateException(
+			"Không đọc được chương ${ref.chapterSlug}: ${lastError?.message}",
+			lastError,
+		)
+	}
 
-    private suspend fun loadTags(): Set<MangaTag> {
-        ensureAgeGateCookie()
-        return runCatching {
-            val payload = webClient.httpGet(apiUrl("tags")).parseJson()
-            if (payload.optBoolean("success") != true) return@runCatching emptySet()
-            val arr = payload.optJSONArray("data") ?: return@runCatching emptySet()
-            (0 until arr.length()).mapNotNullTo(arraySetOf<MangaTag>()) { idx ->
-                val obj = arr.optJSONObject(idx) ?: return@mapNotNullTo null
-                val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
-                val name = obj.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
-                MangaTag(
-                    title = name,
-                    key = slug,
-                    source = source,
-                )
-            }
-        }.getOrDefault(emptySet())
-    }
+	/**
+	 * Decrypt the manifest body. `data` is base64 ciphertext, `key` the
+	 * `hv2t-niga…` ASCII keystream seed and `timestamp` the millisecond clock
+	 * the server used. Returns `null` when the payload is not yet usable
+	 * (cipher/key/timestamp missing, or no `images`), which the caller
+	 * retries.
+	 */
+	private fun decryptManifest(payload: JSONObject): JSONObject? {
+		val cipher = payload.optString("data")
+		val key = payload.optString("key")
+		val timestamp = payload.optLong("timestamp", 0L)
+		if (cipher.isBlank() || key.isBlank() || timestamp == 0L) return null
+		val plain = runCatching {
+			decryptChapterPayload(context.decodeBase64(cipher), key, timestamp)
+		}.getOrElse {
+			log("decryptManifest: ${it.message}")
+			return null
+		}
+		val json = runCatching { JSONObject(plain) }.getOrElse {
+			log("decryptManifest: JSON lỗi (${plain.take(60)})")
+			return null
+		}
+		return json.takeIf { it.optJSONArray("images") != null }
+	}
 
-    // endregion
+	// endregion
 
-    // region pages
+	// region helpers
 
-    /**
-     * The site serves chapter images as an AES-GCM blob fetched from
-     * `GET /api/comics/<mangaId>/<chapterId>/view` (note: the JS calls
-     * `axios.get('/comics/…/view')`, but the axios instance has
-     * `baseURL: "/api"`, so the public URL is
-     * `…/api/comics/2960/22839/view`). The response is then decrypted
-     * with `/security.wasm` using a per-request key and timestamp. We
-     * bundle the whole flow into a single `evaluateJs` call so the
-     * WebView's session cookie and `WebAssembly.instantiate` are reused.
-     *
-     * The page itself is not loaded into the WebView — `evaluateJs` only
-     * sets the origin and runs the script in a stub document. That's
-     * enough: the chapter API and the WASM are same-origin, so the
-     * WebView's cookies (including the user's login session) are
-     * forwarded by `fetch`.
-     */
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        ensureAgeGateCookie()
-        if (chapter.title?.startsWith(LOCK_PREFIX) == true) {
-            throw AuthRequiredException(
-                source,
-                IllegalStateException("Chương này trả phí cần đăng nhập tài khoản VIP bằng webview"),
-            )
-        }
-        val parsed = parseChapterUrl(chapter.url)
-        // The live site uses the chapter slug in both the page URL and API:
-        // /api/comics/<mangaId>/chapter-1/view. Do not rebuild it as a
-        // numeric /chuong-<id> URL; that endpoint is not the reader route.
-        val pageUrl = "$baseUrl/truyen/${parsed.mangaId}/${parsed.chapterSlug}"
-        val webToken = readWebViewAuthToken()
-        log("getPages: WebView auth token=${webToken?.let { "present(${it.length})" } ?: "missing"}")
-        val result = runCatching {
-            readDecryptedChapter(parsed.mangaId, parsed.chapterId, parsed.chapterSlug, pageUrl, webToken)
-        }.getOrElse {
-            log("encrypted chapter reader failed, trying rendered page: ${it.message}")
-            val urls = readRenderedChapter(pageUrl)
-            return urls.mapIndexed { index, imageUrl ->
-                MangaPage(generateUid(imageUrl), imageUrl, null, source)
-            }
-        }
-        // Reaching this line means the chapter API + WASM decrypt both
-        // succeeded, which only happens with a valid session cookie in
-        // the WebView. Promote the cached answer to `true` so the
-        // source-settings row flips from "Đăng nhập" to its signed-in
-        // state immediately, even if the 30 s [authCacheTtlMs] window
-        // hasn't expired yet.
-        cachedAuthCheck = System.currentTimeMillis() to true
-        val images = result.optJSONArray("images") ?: return emptyList()
-        return (0 until images.length()).mapNotNull { index ->
-            val url = images.optString(index).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            MangaPage(
-                id = generateUid(url),
-                url = if (url.startsWith("http")) url else "$baseUrl${url}",
-                preview = null,
-                source = source,
-            )
-        }
-    }
+	private fun apiUrl(path: String): HttpUrl = "$baseUrl/api/$path".toHttpUrl()
 
-    private suspend fun checkWebViewSession(): Boolean = runCatching {
-        val raw = context.evaluateJs(
-            baseUrl,
-            "fetch('/api/users/me', {credentials:'include'}).then(r => String(r.status)).catch(() => '0')",
-        )
-        raw?.trim() == "200"
-    }.getOrDefault(false)
+	private fun comicKeyOf(data: JSONObject): String =
+		data.optString("public_code").takeIf { it.isNotBlank() }
+			?: data.optString("slug").takeIf { it.isNotBlank() }
+			?: data.optLong("id", 0L).toString()
 
-    private suspend fun readWebViewAuthToken(): String? = runCatching {
-        context.evaluateJs(
-            baseUrl,
-            """JSON.stringify({
-                ls: localStorage.getItem('auth_token') || localStorage.getItem('token') || '',
-                ck: document.cookie.match(/(?:^|; )access_token=([^;]+)/)?.[1] || ''
-            })""",
-        )
-    }.getOrNull()?.let { raw ->
-        runCatching {
-            val obj = JSONObject(raw.trim().removeSurrounding("\""))
-            val ls = obj.optString("ls")
-            val ck = obj.optString("ck")
-            (ls.ifBlank { ck }).let { java.net.URLDecoder.decode(it, "UTF-8") }
-        }.getOrNull()
-    }?.takeIf { it.isNotBlank() }
+	private fun JSONObject.toManga(): Manga? {
+		val id = optLong("id", 0L).takeIf { it > 0 } ?: return null
+		val slug = optString("slug").takeIf { it.isNotBlank() } ?: return null
+		val title = optString("title").ifBlank { slug }
+		val cover = optString("cover_image").takeIf { it.isNotBlank() }
+		val description = optString("description").takeIf { it.isNotBlank() }
+		val state = when (optString("status")) {
+			"ONGOING" -> MangaState.ONGOING
+			"COMPLETED" -> MangaState.FINISHED
+			else -> null
+		}
+		val author = optString("author").takeIf { it.isNotBlank() }
+		val translator = optString("translator").takeIf { it.isNotBlank() }
+		val tags = optJSONArray("tags").mapJSONToTags()
+		@Suppress("UNUSED_VARIABLE") val keepId = id
+		return Manga(
+			id = generateUid(slug),
+			title = title,
+			altTitles = optString("other_names").split(',')
+				.mapNotNull { it.trim().takeIf(String::isNotBlank) }
+				.toSet(),
+			url = slug,
+			publicUrl = "$baseUrl/truyen/$slug",
+			rating = RATING_UNKNOWN,
+			contentRating = null,
+			coverUrl = cover,
+			tags = tags,
+			state = state,
+			authors = setOfNotNull(author, translator),
+			description = description,
+			chapters = emptyList(),
+			source = source,
+		)
+	}
 
-    private suspend fun readRenderedChapter(pageUrl: String): List<String> {
-        val script = """
-            (async () => {
-                try {
-                    const html = await (await fetch(${JSONObject.quote(pageUrl)}, {credentials:'include'})).text();
-                    const doc = new DOMParser().parseFromString(html, 'text/html');
-                    return JSON.stringify(Array.from(doc.querySelectorAll('img'))
-                        .map(x => x.currentSrc || x.src || x.getAttribute('data-src'))
-                        .filter(x => x && (x.includes('/free-images/') || x.includes('/media/'))));
-                } catch (e) { return '[]'; }
-            })()
-        """.trimIndent()
-        val raw = runCatching { context.evaluateJs(pageUrl, script) }.getOrNull() ?: return emptyList()
-        return runCatching { JSONArray(raw.trim()).let { arr -> (0 until arr.length()).map { arr.getString(it) }.distinct() } }
-            .getOrDefault(emptyList())
-    }
+	private fun JSONArray?.mapJSONToTags(): Set<MangaTag> {
+		if (this == null) return emptySet()
+		return (0 until length()).mapNotNullTo(arraySetOf<MangaTag>()) { idx ->
+			val obj = optJSONObject(idx) ?: return@mapNotNullTo null
+			val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
+			val name = obj.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
+			MangaTag(title = name, key = slug, source = source)
+		}
+	}
 
-    private suspend fun readDecryptedChapter(
-        mangaId: Long,
-        chapterId: Long,
-        chapterSlugForApi: String,
-        pageUrl: String,
-        authToken: String? = null,
-    ): JSONObject {
-        // The script is loaded with the chapter page as baseUrl so its
-        // origin and cookies line up with the catalog calls. The script
-        // must return a JSON object — we wrap the work in an async IIFE
-        // because `evaluateJs` only gives us back the last evaluated
-        // value as a string.
-        val script = buildDecryptScript(mangaId, chapterId, chapterSlugForApi, authToken)
-        val raw = runCatching { context.evaluateJs(pageUrl, script) }.getOrNull()
-            ?: throw AuthRequiredException(
-                source,
-                IllegalStateException("Không đọc được chương — mở webview để xác nhận 18+ và đăng nhập"),
-            )
-        val trimmed = raw.trim()
-        if (trimmed.startsWith("ERR:")) {
-            val message = trimmed.removePrefix("ERR:").trim()
-            throw AuthRequiredException(
-                source,
-                IllegalStateException("Không đọc được chương: $message"),
-            )
-        }
-        return runCatching { JSONObject(trimmed) }.getOrElse {
-            throw AuthRequiredException(
-                source,
-                IllegalStateException("Phản hồi từ chương không hợp lệ: ${trimmed.take(80)}"),
-            )
-        }
-    }
+	/**
+	 * Build the chapter list. `comicKey` is the public code, because that is
+	 * what both the reader route and the chapter API accept — see the class
+	 * kdoc.
+	 */
+	private fun JSONObject.chapterList(comicKey: String): List<MangaChapter> {
+		val arr = optJSONArray("chapters") ?: return emptyList()
+		if (comicKey.isBlank()) return emptyList()
+		return (0 until arr.length()).mapNotNull { idx ->
+			val obj = arr.optJSONObject(idx) ?: return@mapNotNull null
+			val chapterId = obj.optLong("id", 0L).takeIf { it > 0 } ?: return@mapNotNull null
+			val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			val number = obj.optDouble("chapter_number", -1.0).toFloat()
+			val price = obj.optInt("price", 0)
+			val publishedAt = obj.optString("published_at")
+				.takeIf { it.isNotBlank() }
+				?: obj.optString("created_at").takeIf { it.isNotBlank() }
+			val uploadDate = publishedAt?.let { parseIsoMillis(it) } ?: 0L
+			val baseTitle = when {
+				number < 0f -> "Oneshot"
+				else -> "Chương ${formatChapterNumber(number)}"
+			}
+			val extra = obj.optString("title").takeIf { it.isNotBlank() }
+			val title = if (price > 0) "$LOCK_PREFIX$baseTitle" else baseTitle
+			MangaChapter(
+				id = chapterId,
+				title = if (extra.isNullOrBlank()) title else "$title - $extra",
+				number = if (number < 0f) 0f else number,
+				volume = 0,
+				url = "$comicKey/$chapterId:$slug",
+				scanlator = null,
+				uploadDate = uploadDate,
+				branch = null,
+				source = source,
+			)
+		}.asReversed()
+	}
 
-    // endregion
+	private fun parseChapterUrl(url: String): ChapterRef {
+		val parts = url.split('/', limit = 2)
+		require(parts.size == 2) { "Unexpected chapter url: $url" }
+		val comicKey = parts[0].takeIf { it.isNotBlank() } ?: error("Bad comic key in $url")
+		val chapter = parts[1].split(':', limit = 2)
+		val chapterId = chapter[0].toLongOrNull() ?: error("Bad chapter id in $url")
+		val chapterSlug = chapter.getOrNull(1)?.takeIf { it.isNotBlank() }
+			?: error("Bad chapter slug in $url")
+		return ChapterRef(
+			comicKey = comicKey,
+			chapterId = chapterId,
+			chapterSlug = chapterSlug,
+		)
+	}
 
-    // region helpers
+	private data class ChapterRef(
+		val comicKey: String,
+		val chapterId: Long,
+		val chapterSlug: String,
+	)
 
-    private fun apiUrl(path: String): HttpUrl =
-        "$baseUrl/api/$path".toHttpUrl()
+	// endregion
 
-    private fun JSONObject.toManga(): Manga? {
-        val id = optLong("id", 0L).takeIf { it > 0 } ?: return null
-        val slug = optString("slug").takeIf { it.isNotBlank() } ?: return null
-        val title = optString("title").ifBlank { slug }
-        val cover = optString("cover_image").takeIf { it.isNotBlank() }
-        val description = optString("description").takeIf { it.isNotBlank() }
-        val state = when (optString("status")) {
-            "ONGOING" -> MangaState.ONGOING
-            "COMPLETED" -> MangaState.FINISHED
-            else -> null
-        }
-        val author = optString("author").takeIf { it.isNotBlank() }
-        val translator = optString("translator").takeIf { it.isNotBlank() }
-        val tags = optJSONArray("tags").mapJSONToTags()
-        return Manga(
-            id = generateUid(slug),
-            title = title,
-            altTitles = optString("other_names").split(',')
-                .mapNotNull { it.trim().takeIf(String::isNotBlank) }
-                .toSet(),
-            url = slug,
-            publicUrl = "$baseUrl/truyen/$slug",
-            rating = RATING_UNKNOWN,
-            contentRating = null,
-            coverUrl = cover,
-            tags = tags,
-            state = state,
-            authors = setOfNotNull(author, translator),
-            description = description,
-            chapters = emptyList(),
-            source = source,
-        )
-        // The numeric `id` is intentionally not exposed on the Manga —
-        // it lives only in the chapter URL we build in [chapterList].
-        @Suppress("UNUSED_VARIABLE") val keepId = id
-    }
+	companion object {
+		private const val PAGE_SIZE = 20
+		private const val ADULT_GATE_COOKIE = "hv2t_adult_gate"
+		private const val ACCESS_TOKEN_COOKIE = "access_token"
+		private const val LOCK_PREFIX = "🔒 "
 
-    private fun JSONArray?.mapJSONToTags(): Set<MangaTag> {
-        if (this == null) return emptySet()
-        return (0 until length()).mapNotNullTo(arraySetOf<MangaTag>()) { idx ->
-            val obj = optJSONObject(idx) ?: return@mapNotNullTo null
-            val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
-            val name = obj.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
-            MangaTag(
-                title = name,
-                key = slug,
-                source = source,
-            )
-        }
-    }
+		/** Prefix every `key` carries; the WASM module refuses anything else. */
+		private const val KEY_PREFIX = "hv2t-niga"
+		private const val KEY_MIN_LENGTH = 9
 
-    private fun JSONObject.chapterList(mangaId: Long): List<MangaChapter> {
-        val arr = optJSONArray("chapters") ?: return emptyList()
-        if (mangaId <= 0L) return emptyList()
-        // The catalog endpoint returns chapters newest-first; reverse so
-        // the reader sees them in natural ascending order.
-        return (0 until arr.length()).mapNotNull { idx ->
-            val obj = arr.optJSONObject(idx) ?: return@mapNotNull null
-            val chapterId = obj.optLong("id", 0L).takeIf { it > 0 } ?: return@mapNotNull null
-            val slug = obj.optString("slug").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val number = obj.optDouble("chapter_number", -1.0).toFloat()
-            val price = obj.optInt("price", 0)
-            val publishedAt = obj.optString("published_at")
-                .takeIf { it.isNotBlank() }
-                ?: obj.optString("created_at")
-                    .takeIf { it.isNotBlank() }
-            val uploadDate = publishedAt?.let { parseIsoMillis(it) } ?: 0L
-            val baseTitle = when {
-                number < 0f -> "Oneshot"
-                else -> "Chương ${formatChapterNumber(number)}"
-            }
-            val extra = obj.optString("title").takeIf { it.isNotBlank() }
-            val title = if (price > 0) "$LOCK_PREFIX$baseTitle" else baseTitle
-            val finalTitle = if (extra.isNullOrBlank()) title else "$title - $extra"
-            MangaChapter(
-                id = chapterId,
-                title = finalTitle,
-                number = if (number < 0f) 0f else number,
-                volume = 0,
-                url = "$mangaId/$chapterId:$slug",
-                scanlator = null,
-                uploadDate = uploadDate,
-                branch = null,
-                source = source,
-            )
-        }.asReversed()
-    }
+		/** Same backoff schedule the site uses before it gives up on a chapter. */
+		private val RETRY_PAUSES_MS = longArrayOf(0L, 250L, 750L, 1500L)
 
-    private fun parseChapterUrl(url: String): ChapterRef {
-        val parts = url.split('/', limit = 2)
-        require(parts.size == 2) { "Unexpected chapter url: $url" }
-        val mangaId = parts[0].toLongOrNull() ?: error("Bad manga id in $url")
-        val chapter = parts[1].split(':', limit = 2)
-        val chapterId = chapter[0].toLongOrNull() ?: error("Bad chapter id in $url")
-        val chapterSlug = chapter.getOrNull(1).orEmpty()
-        return ChapterRef(
-            mangaId = mangaId,
-            chapterId = chapterId,
-            chapterSlug = chapterSlug,
-        )
-    }
+		private val RETRYABLE_STATUS = setOf(429, 500, 502, 503, 504, 524)
 
-    private data class ChapterRef(
-        val mangaId: Long,
-        val chapterId: Long,
-        val chapterSlug: String,
-    )
+		/**
+		 * Pure mirror of `/security.wasm`'s `decrypt_buffer`:
+		 *
+		 * ```
+		 * if (keyLen < 9 || key does not start with "hv2t-niga") return cipher unchanged
+		 * for (i = 0; i < len; i++)
+		 *     cipher[i] ^= (uint8)(timestamp >> (i & 7)) ^ key[i % keyLen]
+		 * ```
+		 *
+		 * Exposed at module level so the test harness can feed it the exact
+		 * ciphertext/key/timestamp triples the site returns.
+		 */
+		internal fun decryptChapterPayload(cipher: ByteArray, key: String, timestamp: Long): String {
+			val keyBytes = key.toByteArray(Charsets.UTF_8)
+			require(keyBytes.size >= KEY_MIN_LENGTH) { "Key quá ngắn: ${keyBytes.size}" }
+			require(String(keyBytes, 0, KEY_PREFIX.length, Charsets.UTF_8) == KEY_PREFIX) {
+				"Key không đúng định dạng hv2t-niga"
+			}
+			val out = ByteArray(cipher.size)
+			for (i in cipher.indices) {
+				val clock = ((timestamp ushr (i and 7)) and 0xFF).toInt()
+				out[i] = (cipher[i].toInt() xor clock xor keyBytes[i % keyBytes.size].toInt()).toByte()
+			}
+			return String(out, Charsets.UTF_8)
+		}
 
-    // endregion
+		/**
+		 * Best-effort ISO-8601 parser. Falls back to `0L` on anything that
+		 * does not match — the API always emits `…Z`.
+		 */
+		private fun parseIsoMillis(value: String): Long {
+			return runCatching {
+				val cleaned = value.removeSuffix("Z").substringBefore('+').substringBefore('.')
+				val (date, time) = cleaned.split('T', limit = 2)
+				val ymd = date.split('-')
+				val hms = time.split(':')
+				val calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+				calendar.clear()
+				calendar.set(
+					ymd[0].toInt(),
+					ymd[1].toInt() - 1,
+					ymd[2].toInt(),
+					hms[0].toInt(),
+					hms[1].toInt(),
+					hms.getOrNull(2)?.toInt() ?: 0,
+				)
+				calendar.timeInMillis
+			}.getOrDefault(0L)
+		}
 
-    companion object {
-        private const val PAGE_SIZE = 20
-        private const val ADULT_GATE_COOKIE = "hv2t_adult_gate"
-        private val ADULT_GATE_REGEX = Regex("""hv2t_adult_gate=([^;\s]+)""")
-        private const val LOCK_PREFIX = "🔒 "
-
-        /**
-         * JavaScript snippet run inside the WebView. Returns a JSON string
-         * — either `{images:[...]}` on success, or `ERR:<message>` on
-         * failure. The script is intentionally a single async IIFE so the
-         * last expression (the resolved promise) is the value
-         * `evaluateJs` returns.
-         */
-        private fun buildDecryptScript(mangaId: Long, chapterId: Long, chapterSlugForApi: String, authToken: String? = null): String {
-            val url = "/api/comics/$mangaId/${chapterSlugForApi}/view"
-            val tokenJson = JSONObject.quote(authToken.orEmpty())
-            return """
-                (async () => {
-                    try {
-                        const stored = $tokenJson || localStorage.getItem('auth_token') || localStorage.getItem('token') || '';
-                        const auth = stored
-                            ? (stored.startsWith('Bearer ') ? stored : 'Bearer ' + stored)
-                            : '';
-                        const resp = await fetch(${'$'}url, {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: Object.assign(
-                                { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-                                auth ? { 'Authorization': auth } : {},
-                            ),
-                            body: JSON.stringify({
-                                reader_evidence: 'first-image-loaded',
-                                reader_session_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
-                            }),
-                        });
-                        if (!resp.ok) {
-                            return 'ERR: HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 120);
-                        }
-                        const json = await resp.json();
-                        if (!json || !json.success || !json.data) {
-                            return 'ERR: ' + (json && json.message ? json.message : 'API error');
-                        }
-                        const blob = json.data;
-                        const ct = Uint8Array.from(atob(blob.data), c => c.charCodeAt(0));
-                        const key = new TextEncoder().encode(blob.key);
-                        const ts = BigInt(blob.timestamp);
-                        if (typeof WebAssembly === 'undefined') {
-                            return 'ERR: WebAssembly không khả dụng trong webview';
-                        }
-                        const wasmResp = await fetch('/security.wasm', { credentials: 'same-origin' });
-                        if (!wasmResp.ok) return 'ERR: WASM HTTP ' + wasmResp.status;
-                        const wasmBytes = await wasmResp.arrayBuffer();
-                        const wasm = await WebAssembly.instantiate(wasmBytes, {});
-                        const m = wasm.instance.exports;
-                        const ptr = m.get_buffer_ptr();
-                        const buf = new Uint8Array(m.memory.buffer, ptr, ct.length + key.length);
-                        buf.set(ct, 0);
-                        buf.set(key, ct.length);
-                        m.decrypt_buffer(ct.length, ts, ct.length, key.length);
-                        const plain = new Uint8Array(m.memory.buffer, ptr, ct.length);
-                        const payload = JSON.parse(new TextDecoder('utf-8').decode(plain));
-                        if (!payload || !Array.isArray(payload.images)) {
-                            return 'ERR: payload không có trường images';
-                        }
-                        return JSON.stringify({ images: payload.images });
-                    } catch (e) {
-                        return 'ERR: ' + (e && e.message ? e.message : String(e));
-                    }
-                })()
-            """.trimIndent()
-        }
-
-        /**
-         * Best-effort ISO-8601 parser. Falls back to `0L` on anything
-         * that does not match — the API always emits `…Z` so this is
-         * just a guard for odd input.
-         */
-        private fun parseIsoMillis(value: String): Long {
-            return runCatching {
-                val cleaned = value.removeSuffix("Z").substringBefore('+').substringBefore('.')
-                val (date, time) = cleaned.split('T', limit = 2)
-                val ymd = date.split('-')
-                val hms = time.split(':')
-                val calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
-                calendar.clear()
-                calendar.set(
-                    ymd[0].toInt(),
-                    ymd[1].toInt() - 1,
-                    ymd[2].toInt(),
-                    hms[0].toInt(),
-                    hms[1].toInt(),
-                    hms.getOrNull(2)?.toInt() ?: 0,
-                )
-                calendar.timeInMillis
-            }.getOrDefault(0L)
-        }
-
-        private fun formatChapterNumber(n: Float): String {
-            if (n == n.toInt().toFloat()) return n.toInt().toString()
-            // Round to one decimal, trim trailing zero
-            val rounded = (n * 10).toInt() / 10f
-            return rounded.toString().trimEnd('0').trimEnd('.')
-        }
-    }
+		private fun formatChapterNumber(n: Float): String {
+			if (n == n.toInt().toFloat()) return n.toInt().toString()
+			val rounded = (n * 10).toInt() / 10f
+			return rounded.toString().trimEnd('0').trimEnd('.')
+		}
+	}
 }
