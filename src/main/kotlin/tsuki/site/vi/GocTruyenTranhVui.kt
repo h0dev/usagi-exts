@@ -67,6 +67,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	override val configKeyDomain = ConfigKey.Domain(
 		"goctruyentranhvui41.com",
 		"goctruyentranhvui30.com",
+		"goctruyentranhvui31.com",
 		"goctruyentranhvui42.com",
 	)
 
@@ -235,11 +236,11 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 			}
 		}.build()
 
-		val data = webClient.httpGet(url, apiHeaders())
-			.parseJson()
-			.optJSONObject("result")
-			?.optJSONArray("data")
-			?: return emptyList()
+		val json = webClient.httpGet(url, apiHeaders()).parseJson()
+		val data = json.optJSONObject("result")?.optJSONArray("data")
+			?: throw IllegalStateException(
+				"Góc Truyện Tranh Vui ($domain): ${json.errorMessage()}",
+			)
 
 		val items = (0 until data.length()).mapNotNull { index ->
 			data.optJSONObject(index)?.toManga()
@@ -431,22 +432,14 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 
 	private fun apiUrl(path: String) = "$baseUrl/api/v2/$path".toHttpUrl()
 
-	private suspend fun loadCategories(): Set<MangaTag> {
+	private fun loadCategories(): Set<MangaTag> {
 		cachedCategories?.let { return it }
-		val fetched = runCatching {
-			val array = webClient.httpGet(apiUrl("category"), apiHeaders()).parseJsonArray()
-			(0 until array.length()).mapNotNullTo(arraySetOf()) { index ->
-				val item = array.optJSONObject(index) ?: return@mapNotNullTo null
-				val code = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNullTo null
-				val name = item.optString("name").takeIf { it.isNotBlank() } ?: code
-				MangaTag(title = name, key = code, source = source)
-			}
-		}.getOrNull()
-
-		val categories: Set<MangaTag> = fetched?.takeIf { it.isNotEmpty() } ?: FALLBACK_TAGS
-		log("categories: ${categories.size} (fetched=${fetched != null})")
-		cachedCategories = categories
-		return categories
+		// `/api/v2/category` was removed (HTTP 404). The category codes are
+		// still stable and are also returned by `/api/v2/search`.
+		return FALLBACK_TAGS.also {
+			cachedCategories = it
+			log("categories: ${it.size} (static; category endpoint removed)")
+		}
 	}
 
 	private fun JSONObject.errorMessage(): String = optJSONArray("messages")

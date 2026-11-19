@@ -1,6 +1,7 @@
 package tsuki.site.vi
 
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.IOException
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,7 +25,7 @@ import java.util.TimeZone
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * LXManga (https://lxmanga.space) — Vietnamese hentai manga reader.
+ * LXManga (https://lxmanga.top) — Vietnamese hentai manga reader.
  *
  * The site sits behind Cloudflare "Under Attack" mode, so every request
  * needs a `cf_clearance` cookie before it is answered.
@@ -88,7 +89,7 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	private val tagsLazy = suspendLazy(initializer = { fetchAvailableTags() })
 
-	override val configKeyDomain = ConfigKey.Domain("lxmanga.space")
+	override val configKeyDomain = ConfigKey.Domain("lxmanga.top")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -225,10 +226,9 @@ internal class LxManga(context: MangaLoaderContext) :
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val url = buildListUrl(page, order, filter)
 		val doc = fetchDocument(url)
-		// The markup renders every card twice (a mobile and a desktop
-		// block), so 60 mangas arrive as 120 `div.relative` nodes. The
-		// paginator counts what we return, so collapse them.
-		return doc.select("div.grid div.relative").mapNotNull { div ->
+		// Each `manga-vertical` is one catalogue card. Avoid selecting its
+		// nested `.relative` blocks, which used to duplicate every result.
+		return doc.select("div.manga-vertical").mapNotNull { div ->
 			val href = div.selectFirst("a[href^=/truyen/]")?.attrAsRelativeUrl("href")
 				?: return@mapNotNull null
 			val coverUrl = div.selectFirst("div.cover")?.let { cover ->
@@ -381,78 +381,45 @@ internal class LxManga(context: MangaLoaderContext) :
 	// ============================== Tags ===============================
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val doc = fetchDocument("https://$domain/the-loai")
-		return doc.select("nav.grid.grid-cols-3.md\\:grid-cols-8 button").mapNotNull { button ->
-			val raw = button.attr("wire:click")
-			val key = raw.substringAfterLast(", '").substringBeforeLast("')")
-			if (key.isBlank()) return@mapNotNull null
-			MangaTag(
-				key = key,
-				title = button.select("span.text-ellipsis").text(),
-				source = source,
-			)
+		val doc = fetchDocument("https://$domain/tim-kiem")
+		return doc.select("label").mapNotNull { label ->
+			val key = GENRE_SLUG_REGEX.matchEntire(label.attr("@click"))
+				?.groupValues?.get(1)
+				?: return@mapNotNull null
+			val title = label.text().takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			MangaTag(key = key, title = title, source = source)
 		}.toSet()
 	}
 
 	// ============================== Helpers ===============================
 
-	/**
-	 * Build the URL the catalog endpoints expect. The site has three
-	 * shapes depending on whether the user is searching, filtering
-	 * by tag, or just browsing.
-	 */
-	private fun buildListUrl(page: Int, order: SortOrder, filter: MangaListFilter): String = buildString {
-		append("https://")
-		append(domain)
-
-		when {
-			!filter.query.isNullOrEmpty() -> {
-				append("/tim-kiem")
-				append("?filter[name]=")
-				append(filter.query.urlEncoded())
-
-				if (page > 1) {
-					append("&page=")
-					append(page)
+	/** Build the current unified catalogue/search URL. */
+	private fun buildListUrl(page: Int, order: SortOrder, filter: MangaListFilter): String =
+		"https://$domain/tim-kiem".toHttpUrl().newBuilder()
+			.addQueryParameter("sort", sortQuery(order))
+			.addQueryParameter("page", page.toString())
+			.apply {
+				filter.query?.takeIf { it.isNotBlank() }
+					?.let { addQueryParameter("filter[name]", it) }
+				if (filter.tags.isNotEmpty()) {
+					addQueryParameter("filter[accept_genres]", filter.tags.joinToString(",") { it.key })
 				}
-
-				append("&sort=")
-				append(sortQuery(order))
-			}
-
-			filter.tags.isNotEmpty() -> {
-				val tag = filter.tags.first()
-				append("/the-loai/")
-				.append(tag.key)
-				append("?page=")
-				append(page)
-				append("&sort=")
-				append(sortQuery(order))
-			}
-
-			else -> {
-				append("/danh-sach")
-				.append("?sort=")
-				.append(sortQuery(order))
-				.append("&page=")
-				.append(page)
-			}
-		}
-
-		if (filter.states.isNotEmpty()) {
-			append("&filter[status]=")
-			filter.states.forEach {
-				append(
+				val states = filter.states.mapNotNull {
 					when (it) {
-						MangaState.ONGOING -> "ongoing,"
-						MangaState.FINISHED -> "completed,"
-						MangaState.PAUSED -> "paused,"
-						else -> "ongoing,completed,paused"
-					},
+						MangaState.ONGOING -> "ongoing"
+						MangaState.FINISHED -> "completed"
+						MangaState.PAUSED -> "paused"
+						else -> null
+					}
+				}
+				addQueryParameter(
+					"filter[status]",
+					states.takeIf { it.isNotEmpty() }?.joinToString(",")
+						?: "ongoing,completed,paused",
 				)
 			}
-		}
-	}
+			.build()
+			.toString()
 
 	/**
 	 * Fetch one of the static HTML pages over plain OkHttp — the
@@ -511,6 +478,8 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val ERROR_PREFIX = "ERR:"
 
 		private const val DEFAULT_ACCEPT_LANGUAGE = "vi-VN,vi;q=0.9,en;q=0.8"
+
+		private val GENRE_SLUG_REGEX = Regex("""toggleGenre\('([^']+)'\)""")
 
 		/**
 		 * Extract the chapter's image URLs.
