@@ -630,11 +630,16 @@ internal class Hv2tComics(context: MangaLoaderContext) :
                             ? (stored.startsWith('Bearer ') ? stored : 'Bearer ' + stored)
                             : '';
                         const resp = await fetch(${'$'}url, {
+                            method: 'POST',
                             credentials: 'include',
                             headers: Object.assign(
-                                { 'Accept': 'application/json' },
+                                { 'Accept': 'application/json', 'Content-Type': 'application/json' },
                                 auth ? { 'Authorization': auth } : {},
                             ),
+                            body: JSON.stringify({
+                                reader_evidence: 'first-image-loaded',
+                                reader_session_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
+                            }),
                         });
                         if (!resp.ok) {
                             return 'ERR: HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 120);
