@@ -377,7 +377,16 @@ internal class Hv2tComics(context: MangaLoaderContext) :
             )
         }
         val parsed = parseChapterUrl(chapter.url)
-        val result = readDecryptedChapter(parsed.mangaId, parsed.chapterId, chapter.url)
+        val pageUrl = "$baseUrl/truyen/${parsed.chapterSlug}/chuong-${parsed.chapterId}"
+        val result = runCatching {
+            readDecryptedChapter(parsed.mangaId, parsed.chapterId, pageUrl)
+        }.getOrElse {
+            log("encrypted chapter reader failed, trying rendered page: ${it.message}")
+            val urls = readRenderedChapter(pageUrl)
+            return urls.mapIndexed { index, imageUrl ->
+                MangaPage(generateUid(imageUrl), imageUrl, null, source)
+            }
+        }
         // Reaching this line means the chapter API + WASM decrypt both
         // succeeded, which only happens with a valid session cookie in
         // the WebView. Promote the cached answer to `true` so the
@@ -395,6 +404,23 @@ internal class Hv2tComics(context: MangaLoaderContext) :
                 source = source,
             )
         }
+    }
+
+    private suspend fun readRenderedChapter(pageUrl: String): List<String> {
+        val script = """
+            (async () => {
+                try {
+                    const html = await (await fetch(${JSONObject.quote(pageUrl)}, {credentials:'include'})).text();
+                    const doc = new DOMParser().parseFromString(html, 'text/html');
+                    return JSON.stringify(Array.from(doc.querySelectorAll('img'))
+                        .map(x => x.currentSrc || x.src || x.getAttribute('data-src'))
+                        .filter(x => x && (x.includes('/free-images/') || x.includes('/media/'))));
+                } catch (e) { return '[]'; }
+            })()
+        """.trimIndent()
+        val raw = runCatching { context.evaluateJs(pageUrl, script) }.getOrNull() ?: return emptyList()
+        return runCatching { JSONArray(raw.trim()).let { arr -> (0 until arr.length()).map { arr.getString(it) }.distinct() } }
+            .getOrDefault(emptyList())
     }
 
     private suspend fun readDecryptedChapter(
