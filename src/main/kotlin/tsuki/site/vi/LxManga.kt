@@ -1,17 +1,16 @@
 package tsuki.site.vi
 
+import kotlinx.coroutines.CancellationException
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.IOException
 import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import tsuki.MangaLoaderContext
 import tsuki.MangaParserAuthProvider
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
-import tsuki.exception.AuthRequiredException
 import tsuki.model.*
 import tsuki.network.CloudFlareHelper
 import tsuki.network.CommonHeaders
@@ -56,29 +55,15 @@ import kotlin.time.Duration.Companion.seconds
  * the only way to open the challenge on demand, so we point it at the
  * homepage (Cloudflare-gated, so it renders the challenge immediately).
  *
- * ## What is deliberately NOT here
- *
- * The catalog runs over plain OkHttp. Earlier revisions also fetched
- * pages through the app's WebView (`evaluateJs`) to dodge Cloudflare
- * fingerprint checks, but that turned out to be harmful on this host:
- * `MangaLoaderContextImpl.evaluateJs` wraps the call in a 4 s
- * `withTimeout` while `WebViewExecutor` waits on a *non-cancellable*
- * `suspendCoroutine`, so any call that overruns leaves the shared
- * WebViewExecutor mutex locked for the rest of the process — after
- * which the app's own captcha handling and every WebView-based source
- * time out too. A no-network probe (`return 'pong'`) confirmed it: it
- * came back TIMEOUT. So the WebView is used for exactly one thing
- * ([getPages], which has no alternative) and that script keeps itself
- * well under the 4 s budget.
- *
  * ## Chapter reader
  *
- * The chapter page does not contain image URLs: it ships an obfuscated
- * (~900 kB) script that fetches and decrypts them into `window["_0x…"]`.
- * The only way to run it is a browser, hence [PAGES_SCRIPT], which
- * fetches the page, `document.write`s it so the inline scripts re-run,
- * and polls for the array. It aborts itself after ~2.8 s (fetch ≤2 s,
- * poll ≤0.8 s) to stay inside the app's evaluateJs timeout.
+ * The current reader exposes an encrypted Livewire manifest. [getPages]
+ * extracts its component and manifest key, obtains the per-chapter action
+ * token from `/get_token`, fires `lxViewerImagesUnlock`, and decrypts the
+ * `lx:srcs` dispatch natively. The token travels with each page URL as a
+ * fragment and [intercept] converts it into the CDN's `Token` header.
+ * When the server asks for Turnstile verification, the app opens the
+ * chapter in its browser and retries after that shared session is verified.
  */
 @MangaSourceParser("LXMANGA", "LXManga", "vi", type = ContentType.HENTAI)
 internal class LxManga(context: MangaLoaderContext) :
@@ -312,71 +297,165 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		var lastError: Throwable? = null
 
-		// Download the page with OkHttp first. The app caps a single
-		// `evaluateJs` call at 4 s, and this page is ~900 kB, so letting
-		// the WebView do the download regularly blew that budget. OkHttp
-		// has no such limit, and the app's CloudFlareInterceptor handles a
-		// challenge here exactly as it does for the catalogue.
-		val html = runCatching { webClient.httpGet(chapterUrl).parseRaw() }.getOrElse { e ->
-			log("getPages: fetching $chapterUrl failed: ${e.javaClass.simpleName}: ${e.message}")
-			throw e
-		}
-
-		val raw = runCatching { context.evaluateJs(chapterUrl, pagesScript(html)) }.getOrNull()
-		val trimmed = decodeJsResult(raw)
-		log("getPages ${chapterUrl.take(60)} → ${trimmed.length} chars: ${trimmed.take(80)}")
-
-		val arr = when {
-			trimmed.isEmpty() -> fail("không đọc được chương (webview không phản hồi)")
-			trimmed.startsWith(ERROR_PREFIX) -> fail("không đọc được ảnh (${trimmed.removePrefix(ERROR_PREFIX).trim()})")
-			else -> runCatching { JSONArray(trimmed) }.getOrElse {
-				fail("webview trả về dữ liệu không hợp lệ — ${trimmed.take(80)}")
+		repeat(2) { attempt ->
+			try {
+				val html = webClient.httpGet(chapterUrl).parseRaw()
+				val manifestKey = extractManifestKey(html)
+					?: throw IOException("LXManga: không giải mã được khóa viewer")
+				val component = findViewerComponent(html)
+					?: throw IOException("LXManga: không tìm thấy component ảnh")
+				val csrf = CSRF_REGEX.find(html)?.groupValues?.get(1).orEmpty()
+				val kid = component.getJSONObject("serverMemo")
+					.optJSONObject("data")?.optString("manifestKid").orEmpty()
+				val actionToken = getActionToken(chapterUrl, csrf, kid, manifestKey)
+				if (actionToken == null) {
+					throw VerificationRequiredException()
+				}
+				val urls = fetchImageManifest(chapterUrl, csrf, component, actionToken, manifestKey)
+				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
+				val encodedToken = context.encodeBase64(actionToken.toByteArray())
+				return urls.map { url ->
+					val pageUrl = url.toHttpUrl().newBuilder()
+						.fragment("$TOKEN_MARKER$encodedToken")
+						.build()
+						.toString()
+					MangaPage(generateUid(url), pageUrl, null, source)
+				}
+			} catch (_: VerificationRequiredException) {
+				context.requestBrowserAction(this, chapterUrl)
+			} catch (e: CancellationException) {
+				throw e
+			} catch (e: Exception) {
+				lastError = e
 			}
 		}
-
-		if (arr.length() == 0) {
-			fail("webview không tìm được ảnh — thử lại chương này")
-		}
-
-		return (0 until arr.length()).mapNotNull { i ->
-			val url = arr.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-			MangaPage(
-				id = generateUid(url),
-				preview = null,
-				url = url,
-				source = source,
-			)
-		}
+		throw lastError ?: IOException("LXManga: không tải được danh sách trang")
 	}
 
-	/** [PAGES_SCRIPT] with the already-downloaded chapter markup spliced in. */
-	private fun pagesScript(html: String): String =
-		PAGES_SCRIPT.replace(HTML_PLACEHOLDER, JSONObject.quote(html))
-
-	/**
-	 * Report a chapter failure.
-	 *
-	 * `AuthRequiredException` is the app's "ask the user to sign in"
-	 * signal, and this site has no login at all — solving the Cloudflare
-	 * challenge is the entire gate, and the catalogue proves it is
-	 * already solved. Throwing it here made the app pop the "Đăng nhập"
-	 * screen, which then closed itself immediately (isAuthorized() sees
-	 * the clearance) and popped up again on the retry: a loop that tells
-	 * the user to log in to a site without accounts. So only ask for
-	 * authentication when we genuinely have no clearance; otherwise
-	 * report a plain, retryable error.
-	 */
-	private fun fail(reason: String): Nothing {
-		val message = "LXManga: $reason"
-		if (hasClearance()) {
-			throw IOException(message)
+	private fun findViewerComponent(html: String): JSONObject? = WIRE_DATA_REGEX.findAll(html)
+		.mapNotNull { match ->
+			runCatching { JSONObject(org.jsoup.parser.Parser.unescapeEntities(match.groupValues[1], false)) }.getOrNull()
 		}
-		throw AuthRequiredException(source, IllegalStateException(message))
+		.firstOrNull { it.optJSONObject("fingerprint")?.optString("name") == "chapter-viewer-images" }
+
+	private fun extractManifestKey(html: String): String? {
+		var candidates = listOf(html)
+		repeat(4) {
+			val next = mutableListOf<String>()
+			for (text in candidates) {
+				MF_KEY_REGEX.find(text)?.let { return it.groupValues[1].replace("\\/", "/") }
+				ARRAY_START_REGEX.findAll(text).forEach { match ->
+					val end = text.indexOf(']', match.range.last + 1)
+					if (end < 0) return@forEach
+					val raw = text.substring(match.range.last + 1, end)
+					if (raw.any { it !in "0123456789abcdefABCDEF\"', \t\r\n" }) return@forEach
+					val hex = HEX_REGEX.findAll(raw).joinToString("") { it.value }
+					decodeHexLayer(hex)?.let(next::add)
+				}
+			}
+			if (next.isEmpty()) return null
+			candidates = next
+		}
+		return null
 	}
 
-	private fun hasClearance(): Boolean =
-		runCatching { CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl) != null }.getOrDefault(false)
+	private fun decodeHexLayer(hex: String): String? = runCatching {
+		if (hex.length < 66 || hex.length % 2 != 0) return null
+		val bytes = ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+		String(ByteArray(bytes.size - 32) { i -> (bytes[i + 32].toInt() xor bytes[i % 32].toInt()).toByte() })
+	}.getOrNull()
+
+	private suspend fun getActionToken(chapterUrl: String, csrf: String, kid: String, key: String): String? {
+		val headers = Headers.Builder()
+			.add("Accept", "application/json")
+			.add("Content-Type", "application/json")
+			.add("X-CSRF-TOKEN", csrf)
+			.add(CommonHeaders.REFERER, chapterUrl)
+			.add(CommonHeaders.ORIGIN, "https://$domain")
+			.build()
+		val url = "https://$domain/get_token".toHttpUrl().newBuilder()
+			.apply { if (kid.isNotEmpty()) addQueryParameter("kid", kid) }
+			.build()
+		val response = webClient.httpGet(url, headers)
+		val body = response.body.string()
+		if (!response.isSuccessful) return null
+		val json = runCatching { JSONObject(body) }.getOrNull() ?: return null
+		if (json.optBoolean("is_bot", true)) return null
+		return json.optString("action_token").takeIf { it.isNotEmpty() }
+			?: json.optString("e").takeIf { it.isNotEmpty() }?.let { encrypted ->
+				xorBase64(encrypted, key)?.let { JSONObject(it).optString("at") }?.takeIf { it.isNotEmpty() }
+			}
+	}
+
+	private suspend fun fetchImageManifest(
+		chapterUrl: String,
+		csrf: String,
+		component: JSONObject,
+		actionToken: String,
+		key: String,
+	): List<String> {
+		val payload = JSONObject()
+			.put("fingerprint", component.getJSONObject("fingerprint"))
+			.put("serverMemo", component.getJSONObject("serverMemo"))
+			.put("updates", JSONArray().put(JSONObject()
+				.put("type", "fireEvent")
+				.put("payload", JSONObject()
+					.put("id", randomId())
+					.put("event", "lxViewerImagesUnlock")
+					.put("params", JSONArray().put(actionToken)))))
+		val headers = Headers.Builder()
+			.add("Accept", "text/html, application/xhtml+xml")
+			.add("Content-Type", "application/json")
+			.add("X-Livewire", "true")
+			.add("X-CSRF-TOKEN", csrf)
+			.add(CommonHeaders.REFERER, chapterUrl)
+			.add(CommonHeaders.ORIGIN, "https://$domain")
+			.build()
+		val json = webClient.httpPost("https://$domain/livewire/message/chapter-viewer-images".toHttpUrl(), payload, headers).parseJson()
+		val dispatches = json.optJSONObject("effects")?.optJSONArray("dispatches") ?: return emptyList()
+		for (i in 0 until dispatches.length()) {
+			val item = dispatches.optJSONObject(i) ?: continue
+			if (item.optString("event") != "lx:srcs") continue
+			val encrypted = item.optJSONObject("data")?.optString("data").orEmpty()
+			val manifest = xorBase64(encrypted, key)?.let { JSONObject(it) } ?: continue
+			val urls = manifest.optJSONArray("u") ?: continue
+			val flags = manifest.optJSONArray("f")
+			return (0 until urls.length()).mapNotNull { index ->
+				urls.optString(index).takeIf { it.isNotEmpty() && ((flags?.optInt(index, 0) ?: 0) and 1 == 0) }
+			}
+		}
+		return emptyList()
+	}
+
+	private fun xorBase64(payload: String, key: String): String? = runCatching {
+		val bytes = context.decodeBase64(payload)
+		val keyBytes = key.toByteArray()
+		String(ByteArray(bytes.size) { i -> (bytes[i].toInt() xor keyBytes[i % keyBytes.size].toInt()).toByte() })
+	}.getOrNull()
+
+	private fun randomId(): String = (1..7).map { ID_CHARS.random() }.joinToString("")
+
+	private class VerificationRequiredException : Exception()
+
+	override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
+		val request = chain.request()
+		val fragment = request.url.fragment
+		if (fragment == null || !fragment.startsWith(TOKEN_MARKER)) {
+			return chain.proceed(request)
+		}
+		val token = runCatching {
+			String(context.decodeBase64(fragment.removePrefix(TOKEN_MARKER)))
+		}.getOrNull() ?: return chain.proceed(request)
+		val updated = request.newBuilder()
+			.url(request.url.newBuilder().fragment(null).build())
+			.header("Token", token.ifEmpty { "x" })
+			.header(CommonHeaders.REFERER, "https://$domain/")
+			.header(CommonHeaders.ORIGIN, "https://$domain")
+			.build()
+		return chain.proceed(updated)
+	}
 
 	// ============================== Tags ===============================
 
@@ -452,18 +531,6 @@ internal class LxManga(context: MangaLoaderContext) :
 		else -> "-updated_at"
 	}
 
-	/**
-	 * Undo the JSON encoding `WebView.evaluateJavascript` applies to
-	 * string results (a returned string arrives quoted and escaped).
-	 */
-	private fun decodeJsResult(raw: String?): String {
-		val text = raw?.trim().orEmpty()
-		if (text.length < 2 || !text.startsWith("\"") || !text.endsWith("\"")) {
-			return text
-		}
-		return runCatching { JSONTokener(text).nextValue() as? String ?: text }.getOrDefault(text)
-	}
-
 	private fun cookieNames(): String = runCatching {
 		context.cookieJar.getCookies(domain).joinToString(",") { it.name }
 	}.getOrDefault("?")
@@ -474,89 +541,15 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	companion object {
 		private const val LOG_TAG = "[LxManga]"
-
-		private const val ERROR_PREFIX = "ERR:"
-
 		private const val DEFAULT_ACCEPT_LANGUAGE = "vi-VN,vi;q=0.9,en;q=0.8"
+		private const val ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+		private const val TOKEN_MARKER = "LXMANGA_TOKEN="
 
 		private val GENRE_SLUG_REGEX = Regex("""toggleGenre\('([^']+)'\)""")
-
-		/**
-		 * Extract the chapter's image URLs.
-		 *
-		 * The chapter page carries no image URLs — it ships an obfuscated
-		 * script that fetches and decrypts them into `window["_0x…"]`.
-		 * `evaluateJs(url, …)` loads a stub document whose origin is the
-		 * URL, so the fetch below is same-origin: the WebView's HttpOnly
-		 * `cf_clearance` is attached, `document.write` re-runs the page's
-		 * own scripts, and we poll for the decrypted array (its property
-		 * name is randomised on every load).
-		 *
-		 * The app caps a single `evaluateJs` call at 4 s and a call that
-		 * overruns locks its shared WebView mutex, so the script bounds
-		 * itself: the fetch aborts after 2 s and the poll gives up after
-		 * another 0.8 s, well inside the budget.
-		 */
-		private const val HTML_PLACEHOLDER = "__LXMANGA_HTML__"
-
-		/**
-		 * Render the chapter markup we downloaded ourselves and read the
-		 * image URLs out of it.
-		 *
-		 * The chapter page carries no image URLs: it ships an obfuscated
-		 * script that decrypts them into `window["_0x…"]` (the property
-		 * name is randomised on every load). Running that script needs a
-		 * browser, hence `evaluateJs` — but the *download* is done by
-		 * [getPages] with OkHttp and spliced in below, because a single
-		 * `evaluateJs` call is capped at 4 s by the app and a ~900 kB page
-		 * does not reliably fit in that budget together with the script.
-		 *
-		 * `document.write` runs the page's own inline scripts, and the loop
-		 * waits for the decrypted array to appear. Staying inside the app's
-		 * 4 s budget matters: the app waits on a non-cancellable
-		 * continuation while holding its shared WebView mutex, so a call
-		 * that overruns locks every other WebView call in the process.
-		 *
-		 * The poll is deliberately short. For comparison, the official
-		 * keiyoushi extension for this site family needs
-		 * `runWebView(timeout = 60.seconds)` with a ~19 kB hook injected on
-		 * `onPageStarted` (it has to wrap fetch/XHR to capture both the
-		 * image URLs and the per-chapter `Token` from `/get_token`, and it
-		 * even simulates clicks on an in-page Turnstile), polling once a
-		 * second. Tsuki/Usagi exposes no such API — only a one-shot
-		 * `evaluateJs` on a blank document that the app caps at 4 s — so
-		 * this can succeed only when the page's reader script finishes
-		 * almost immediately, which is why a failure here is reported
-		 * plainly instead of being retried or turned into a login prompt.
-		 */
-		private val PAGES_SCRIPT: String = """
-			(async () => {
-				try {
-					document.open();
-					document.write($HTML_PLACEHOLDER);
-					document.close();
-
-					const start = Date.now();
-					while (Date.now() - start < 1500) {
-						const keys = Object.keys(window);
-						for (let i = 0; i < keys.length; i++) {
-							const key = keys[i];
-							if (!/^_0x[a-f0-9]+${'$'}/i.test(key)) continue;
-							const value = window[key];
-							if (!Array.isArray(value) || value.length === 0) continue;
-							const urls = value.filter(function (u) {
-								return typeof u === 'string' &&
-									/\.(?:jpe?g|png|webp)(?:[?#]|${'$'})/i.test(u);
-							});
-							if (urls.length > 0) return JSON.stringify(urls);
-						}
-						await new Promise(function (r) { setTimeout(r, 100); });
-					}
-					return 'ERR: ảnh chưa xuất hiện kịp — đóng trang đọc rồi mở lại';
-				} catch (e) {
-					return 'ERR: ' + (e && e.message ? e.message : String(e));
-				}
-			})()
-		""".trimIndent()
+		private val CSRF_REGEX = Regex("""var\s+csrf_token\s*=\s*'([^']+)'""")
+		private val WIRE_DATA_REGEX = Regex("""wire:initial-data="((?:[^"\\]|\\.)*)"""")
+		private val MF_KEY_REGEX = Regex("""__lxMfkey\s*=\s*"([^"]+)"""")
+		private val ARRAY_START_REGEX = Regex("""var\s+_\w+\s*=\s*\[""")
+		private val HEX_REGEX = Regex("""[0-9a-fA-F]+""")
 	}
 }
