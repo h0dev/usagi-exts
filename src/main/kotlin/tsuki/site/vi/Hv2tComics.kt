@@ -590,9 +590,16 @@ internal class Hv2tComics(context: MangaLoaderContext) :
             return """
                 (async () => {
                     try {
+                        const stored = localStorage.getItem('auth_token') || '';
+                        const auth = stored
+                            ? (stored.startsWith('Bearer ') ? stored : 'Bearer ' + stored)
+                            : '';
                         const resp = await fetch(${'$'}url, {
                             credentials: 'include',
-                            headers: { 'Accept': 'application/json' },
+                            headers: Object.assign(
+                                { 'Accept': 'application/json' },
+                                auth ? { 'Authorization': auth } : {},
+                            ),
                         });
                         if (!resp.ok) {
                             return 'ERR: HTTP ' + resp.status + ' ' + (await resp.text()).slice(0, 120);
