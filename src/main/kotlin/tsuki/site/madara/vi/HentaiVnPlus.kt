@@ -62,7 +62,9 @@ internal class HentaiVnPlus(context: MangaLoaderContext) :
         val dateFormat = SimpleDateFormat("d/M/yyyy", Locale.ROOT)
         val stateText = doc.select(".page-info").text()
         val chapters = doc.select("table.listing tr").mapNotNull { row ->
-            val a = row.selectFirst("a[href*=/truyen/][href*=/chap-]") ?: return@mapNotNull null
+            // HentaiVNReal uses arbitrary chapter slugs for one-shots
+            // (e.g. /oneshot), not only /chap-N.
+            val a = row.selectFirst("a[href*=/truyen/]") ?: return@mapNotNull null
             val href = a.attrAsRelativeUrl("href")
             val date = row.select("td").lastOrNull()?.text()?.trim()
             MangaChapter(
@@ -123,5 +125,6 @@ internal class HentaiVnPlus(context: MangaLoaderContext) :
 
     private fun chapterNumber(title: String): Float =
         Regex("(?i)(?:chap(?:ter)?|chương)\\s*([0-9]+(?:\\.[0-9]+)?)")
-            .find(title)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+            .find(title)?.groupValues?.get(1)?.toFloatOrNull()
+            ?: if (title.contains("oneshot", true)) 1f else 0f
 }
