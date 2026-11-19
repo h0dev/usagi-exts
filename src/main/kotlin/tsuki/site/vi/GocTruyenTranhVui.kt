@@ -3,6 +3,7 @@ package tsuki.site.vi
 import androidx.collection.arraySetOf
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Protocol
 import okio.ByteString.Companion.decodeBase64
 import org.json.JSONObject
 import tsuki.MangaLoaderContext
@@ -56,6 +57,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	 */
 	override val webClient = OkHttpWebClient(
 		context.httpClient.newBuilder()
+			.protocols(listOf(Protocol.HTTP_1_1))
 			.callTimeout(20.seconds)
 			.rateLimit(30, 1.seconds)
 			.build(),
@@ -65,6 +67,7 @@ internal class GocTruyenTranhVui(context: MangaLoaderContext):
 	override val configKeyDomain = ConfigKey.Domain(
 		"goctruyentranhvui41.com",
 		"goctruyentranhvui30.com",
+		"goctruyentranhvui42.com",
 	)
 
 	override val userAgentKey = ConfigKey.UserAgent(
