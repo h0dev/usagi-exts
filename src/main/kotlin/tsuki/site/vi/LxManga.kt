@@ -2,6 +2,7 @@ package tsuki.site.vi
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okio.IOException
@@ -329,6 +330,7 @@ internal class LxManga(context: MangaLoaderContext) :
 				}
 				val urls = fetchImageManifest(chapterUrl, csrf, component, actionToken, manifestKey)
 				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
+				rememberChapterSession(urls.firstOrNull(), chapterUrl, csrf, kid, manifestKey, actionToken)
 				val encodedToken = context.encodeBase64(actionToken.toByteArray())
 				urls.map { url ->
 					rememberToken(url, actionToken)
@@ -352,6 +354,55 @@ internal class LxManga(context: MangaLoaderContext) :
 	}
 
 	/** Wait out the site's own `Retry-After` instead of failing the chapter. */
+	private fun rememberChapterSession(
+		firstImageUrl: String?,
+		chapterUrl: String,
+		csrf: String,
+		kid: String,
+		manifestKey: String,
+		token: String,
+	) {
+		val parsed = runCatching { firstImageUrl?.toHttpUrl() }.getOrNull() ?: return
+		val segments = parsed.pathSegments
+		if (segments.size < 4) return
+		chapterSessions["${segments[1]}/${segments[2]}"] = ChapterSession(chapterUrl, csrf, kid, manifestKey)
+	}
+
+	/** Single-flight refresh of a chapter's CDN token, safe to call from the interceptor. */
+	private fun refreshImageToken(url: okhttp3.HttpUrl): String? {
+		val segments = url.pathSegments
+		if (segments.size < 4) return null
+		val key = "${segments[1]}/${segments[2]}"
+		val session = chapterSessions[key] ?: return null
+		synchronized(refreshLock) {
+			val now = System.currentTimeMillis()
+			if (now - session.refreshedAt < REFRESH_COOLDOWN_MS) {
+				return chapterTokens[key]
+			}
+			session.refreshedAt = now
+			return runBlocking {
+				val token = runCatching {
+					getActionToken(session.chapterUrl, session.csrf, session.kid, session.manifestKey)
+				}.getOrNull()
+				if (token != null) {
+					chapterTokens[key] = token
+					log("intercept: refreshed token for ${key.take(18)}")
+				}
+				token
+			}
+		}
+	}
+
+	private class ChapterSession(
+		val chapterUrl: String,
+		val csrf: String,
+		val kid: String,
+		val manifestKey: String,
+	) {
+		@Volatile
+		var refreshedAt: Long = 0L
+	}
+
 	/** `@lxmanga/<mangaId>/<chapterId>` — the part that identifies a chapter on the CDN. */
 	private fun chapterKeyToken(url: okhttp3.HttpUrl): String? {
 		val segments = url.pathSegments
@@ -554,7 +605,23 @@ internal class LxManga(context: MangaLoaderContext) :
 			.header(CommonHeaders.REFERER, "https://$domain/")
 			.header(CommonHeaders.ORIGIN, "https://$domain")
 			.build()
-		return chain.proceed(updated)
+		val response = chain.proceed(updated)
+		if (response.code != 403) return response
+
+		// The CDN token has a short TTL; the site itself reacts to a 403 by fetching a
+		// new token once and replaying the request. Do the same, otherwise pages opened
+		// a few minutes after getPages() stay blank.
+		val fresh = refreshImageToken(cleanUrl) ?: return response
+		log("intercept: 403 on ${cleanUrl.host}, retried with a fresh token")
+		response.close()
+		return chain.proceed(
+			request.newBuilder()
+				.url(cleanUrl)
+				.header("Token", fresh)
+				.header(CommonHeaders.REFERER, "https://$domain/")
+				.header(CommonHeaders.ORIGIN, "https://$domain")
+				.build(),
+		)
 	}
 
 	// ============================== Tags ===============================
@@ -652,6 +719,9 @@ internal class LxManga(context: MangaLoaderContext) :
 
 		private val imageTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
 		private val chapterTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
+		private val chapterSessions = java.util.concurrent.ConcurrentHashMap<String, ChapterSession>()
+		private val refreshLock = Any()
+		private const val REFRESH_COOLDOWN_MS = 2_000L
 
 		private val pageCache = LinkedHashMap<String, List<MangaPage>>()
 
