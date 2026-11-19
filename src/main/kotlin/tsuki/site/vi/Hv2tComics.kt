@@ -193,12 +193,9 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      * `evaluateJs` from the activity.
      */
     override suspend fun isAuthorized(): Boolean {
-        val now = System.currentTimeMillis()
-        cachedAuthCheck?.takeIf { it.second && now - it.first < authCacheTtlMs }?.let { return it.second }
-        val token = readWebViewAuthToken()
-        val authorized = !token.isNullOrBlank() || checkWebViewSession()
-        cachedAuthCheck = now to authorized
-        log("isAuthorized: token=${if (!token.isNullOrBlank()) "present" else "missing"}, session=$authorized")
+        val cookies = context.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
+        val authorized = cookies.any { it.name == "access_token" && it.value.isNotBlank() }
+        log("isAuthorized: cookie access_token=${if (authorized) "present" else "missing"}")
         return authorized
     }
 
