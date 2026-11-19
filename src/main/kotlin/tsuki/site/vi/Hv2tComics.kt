@@ -378,8 +378,10 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         }
         val parsed = parseChapterUrl(chapter.url)
         val pageUrl = "$baseUrl/truyen/${parsed.chapterSlug}/chuong-${parsed.chapterId}"
+        val webToken = readWebViewAuthToken()
+        log("getPages: WebView auth token=${webToken?.let { "present(${it.length})" } ?: "missing"}")
         val result = runCatching {
-            readDecryptedChapter(parsed.mangaId, parsed.chapterId, pageUrl)
+            readDecryptedChapter(parsed.mangaId, parsed.chapterId, pageUrl, webToken)
         }.getOrElse {
             log("encrypted chapter reader failed, trying rendered page: ${it.message}")
             val urls = readRenderedChapter(pageUrl)
@@ -406,6 +408,13 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         }
     }
 
+    private suspend fun readWebViewAuthToken(): String? = runCatching {
+        context.evaluateJs(
+            baseUrl,
+            "(localStorage.getItem('auth_token') || localStorage.getItem('token') || '')",
+        )
+    }.getOrNull()?.trim()?.removeSurrounding("\"")?.takeIf { it.isNotBlank() }
+
     private suspend fun readRenderedChapter(pageUrl: String): List<String> {
         val script = """
             (async () => {
@@ -427,13 +436,14 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         mangaId: Long,
         chapterId: Long,
         pageUrl: String,
+        authToken: String? = null,
     ): JSONObject {
         // The script is loaded with the chapter page as baseUrl so its
         // origin and cookies line up with the catalog calls. The script
         // must return a JSON object — we wrap the work in an async IIFE
         // because `evaluateJs` only gives us back the last evaluated
         // value as a string.
-        val script = buildDecryptScript(mangaId, chapterId)
+        val script = buildDecryptScript(mangaId, chapterId, authToken)
         val raw = runCatching { context.evaluateJs(pageUrl, script) }.getOrNull()
             ?: throw AuthRequiredException(
                 source,
@@ -585,12 +595,13 @@ internal class Hv2tComics(context: MangaLoaderContext) :
          * last expression (the resolved promise) is the value
          * `evaluateJs` returns.
          */
-        private fun buildDecryptScript(mangaId: Long, chapterId: Long): String {
+        private fun buildDecryptScript(mangaId: Long, chapterId: Long, authToken: String? = null): String {
             val url = "/api/comics/$mangaId/$chapterId/view"
+            val tokenJson = JSONObject.quote(authToken.orEmpty())
             return """
                 (async () => {
                     try {
-                        const stored = localStorage.getItem('auth_token') || '';
+                        const stored = $tokenJson || localStorage.getItem('auth_token') || localStorage.getItem('token') || '';
                         const auth = stored
                             ? (stored.startsWith('Bearer ') ? stored : 'Bearer ' + stored)
                             : '';
