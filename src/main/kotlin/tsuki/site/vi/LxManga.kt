@@ -382,14 +382,32 @@ internal class LxManga(context: MangaLoaderContext) :
 				return block()
 			} catch (e: TooManyRequestExceptions) {
 				attempt++
-				val wait = e.retryAt?.let { at ->
-					java.time.Duration.between(java.time.Instant.now(), at).toMillis()
-				}?.let { if (it in 1L..15_000L) it + 250L else 1_500L } ?: 1_500L
+				val wait = retryDelayMillis(e)
 				log("getPages: HTTP 429 on ${e.url.takeLast(40)}, waiting ${wait}ms (try $attempt)")
 				if (attempt >= MAX_429_RETRIES) throw e
 				delay(wait)
 			}
 		}
+	}
+
+	/**
+	 * `Retry-After` hint carried by [TooManyRequestExceptions].
+	 *
+	 * The host app ships its own Tsuki build, and the getters for that hint are
+	 * not present in every version — a direct call compiles against 1.0.5 and
+	 * then dies with `NoSuchMethodError` at runtime on an older host. Reading
+	 * them reflectively keeps the parser working on both.
+	 */
+	private fun retryDelayMillis(e: TooManyRequestExceptions): Long {
+		val retryAt = runCatching {
+			val at = e.javaClass.getMethod("getRetryAt").invoke(e) as? java.time.Instant
+			at?.let { java.time.Duration.between(java.time.Instant.now(), it).toMillis() }
+		}.getOrNull()
+		val retryDelay = runCatching {
+			e.javaClass.getMethod("getRetryDelay").invoke(e) as? Long
+		}.getOrNull()
+		val raw = retryAt ?: retryDelay ?: -1L
+		return if (raw in 1L..15_000L) raw + 250L else 900L
 	}
 
 	/** Browser-navigation headers for the chapter document itself. */
