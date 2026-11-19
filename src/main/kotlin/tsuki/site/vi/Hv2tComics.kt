@@ -194,7 +194,7 @@ internal class Hv2tComics(context: MangaLoaderContext) :
      */
     override suspend fun isAuthorized(): Boolean {
         val now = System.currentTimeMillis()
-        cachedAuthCheck?.takeIf { now - it.first < authCacheTtlMs }?.let { return it.second }
+        cachedAuthCheck?.takeIf { it.second && now - it.first < authCacheTtlMs }?.let { return it.second }
         val token = readWebViewAuthToken()
         val authorized = !token.isNullOrBlank() || checkWebViewSession()
         cachedAuthCheck = now to authorized
@@ -382,11 +382,14 @@ internal class Hv2tComics(context: MangaLoaderContext) :
             )
         }
         val parsed = parseChapterUrl(chapter.url)
-        val pageUrl = "$baseUrl/truyen/${parsed.chapterSlug}/chuong-${parsed.chapterId}"
+        // The live site uses the chapter slug in both the page URL and API:
+        // /api/comics/<mangaId>/chapter-1/view. Do not rebuild it as a
+        // numeric /chuong-<id> URL; that endpoint is not the reader route.
+        val pageUrl = "$baseUrl/truyen/${parsed.mangaId}/${parsed.chapterSlug}"
         val webToken = readWebViewAuthToken()
         log("getPages: WebView auth token=${webToken?.let { "present(${it.length})" } ?: "missing"}")
         val result = runCatching {
-            readDecryptedChapter(parsed.mangaId, parsed.chapterId, pageUrl, webToken)
+            readDecryptedChapter(parsed.mangaId, parsed.chapterId, parsed.chapterSlug, pageUrl, webToken)
         }.getOrElse {
             log("encrypted chapter reader failed, trying rendered page: ${it.message}")
             val urls = readRenderedChapter(pageUrl)
@@ -458,6 +461,7 @@ internal class Hv2tComics(context: MangaLoaderContext) :
     private suspend fun readDecryptedChapter(
         mangaId: Long,
         chapterId: Long,
+        chapterSlugForApi: String,
         pageUrl: String,
         authToken: String? = null,
     ): JSONObject {
@@ -466,7 +470,7 @@ internal class Hv2tComics(context: MangaLoaderContext) :
         // must return a JSON object — we wrap the work in an async IIFE
         // because `evaluateJs` only gives us back the last evaluated
         // value as a string.
-        val script = buildDecryptScript(mangaId, chapterId, authToken)
+        val script = buildDecryptScript(mangaId, chapterId, chapterSlugForApi, authToken)
         val raw = runCatching { context.evaluateJs(pageUrl, script) }.getOrNull()
             ?: throw AuthRequiredException(
                 source,
@@ -618,8 +622,8 @@ internal class Hv2tComics(context: MangaLoaderContext) :
          * last expression (the resolved promise) is the value
          * `evaluateJs` returns.
          */
-        private fun buildDecryptScript(mangaId: Long, chapterId: Long, authToken: String? = null): String {
-            val url = "/api/comics/$mangaId/$chapterId/view"
+        private fun buildDecryptScript(mangaId: Long, chapterId: Long, chapterSlugForApi: String, authToken: String? = null): String {
+            val url = "/api/comics/$mangaId/${chapterSlugForApi}/view"
             val tokenJson = JSONObject.quote(authToken.orEmpty())
             return """
                 (async () => {
