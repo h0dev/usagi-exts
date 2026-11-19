@@ -315,7 +315,9 @@ internal class LxManga(context: MangaLoaderContext) :
 			// it out is the difference between "works" and "open the browser once per
 			// chapter", because opening a chapter costs 3 requests back to back.
 			withRetryOn429 {
+				val startedAt = System.currentTimeMillis()
 				val html = webClient.httpGet(chapterUrl, chapterDocumentHeaders()).parseRaw()
+				log("getPages: html ${html.length}B in ${System.currentTimeMillis() - startedAt}ms")
 				val manifestKey = extractManifestKey(html)
 					?: throw IOException("LXManga: không giải mã được khóa viewer")
 				val component = findViewerComponent(html)
@@ -328,17 +330,18 @@ internal class LxManga(context: MangaLoaderContext) :
 					log("getPages: verification required for ${chapterUrl.takeLast(50)}")
 					throw VerificationRequiredException()
 				}
+				val manifestStarted = System.currentTimeMillis()
 				val urls = fetchImageManifest(chapterUrl, csrf, component, actionToken, manifestKey)
+				log("getPages: manifest ${urls.size} pages in ${System.currentTimeMillis() - manifestStarted}ms")
 				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
 				rememberChapterSession(urls.firstOrNull(), chapterUrl, csrf, kid, manifestKey, actionToken)
-				val encodedToken = context.encodeBase64(actionToken.toByteArray())
 				urls.map { url ->
 					rememberToken(url, actionToken)
-					val pageUrl = url.toHttpUrl().newBuilder()
-						.fragment("$TOKEN_MARKER$encodedToken")
-						.build()
-						.toString()
-					MangaPage(generateUid(url), pageUrl, null, source)
+					// Keep the CDN URL byte-identical to the manifest one. A token in the
+					// fragment makes every visit a different URL, which defeats the app's
+					// image cache; the token is resolved from the maps in [intercept] and
+					// refreshed there on 403.
+					MangaPage(generateUid(url), url, null, source)
 				}
 			}
 		} catch (_: VerificationRequiredException) {
@@ -605,7 +608,12 @@ internal class LxManga(context: MangaLoaderContext) :
 			.header(CommonHeaders.REFERER, "https://$domain/")
 			.header(CommonHeaders.ORIGIN, "https://$domain")
 			.build()
+		val startedAt = System.currentTimeMillis()
 		val response = chain.proceed(updated)
+		val elapsed = System.currentTimeMillis() - startedAt
+		if (elapsed > 1500 || response.code != 200) {
+			log("intercept: ${response.code} ${elapsed}ms ${cleanUrl.toString().takeLast(28)}")
+		}
 		if (response.code != 403) return response
 
 		// The CDN token has a short TTL; the site itself reacts to a 403 by fetching a
