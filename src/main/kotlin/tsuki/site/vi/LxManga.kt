@@ -102,11 +102,15 @@ internal class LxManga(context: MangaLoaderContext) :
 	 * `SourceAuthActivity` close itself once the user is through.
 	 */
 	override suspend fun isAuthorized(): Boolean {
-		val clearance = runCatching {
-			CloudFlareHelper.getClearanceCookie(context.cookieJar, baseUrl)
-		}.getOrNull()
-		log("isAuthorized=${clearance != null} cookies=[${cookieNames()}]")
-		return clearance != null
+		// The reader gate is a server-side flag on the Laravel session, not a
+		// `cf_clearance`. A chapter that already had its Turnstile solved keeps
+		// working as long as `lxmanga_session` is present, so that is the signal
+		// the settings row should use.
+		val session = runCatching {
+			context.cookieJar.getCookies(domain).any { it.name == SESSION_COOKIE }
+		}.getOrDefault(false)
+		log("isAuthorized=$session cookies=[${cookieNames()}]")
+		return session
 	}
 
 	/** No account system on this site, so there is no name to show. */
@@ -297,6 +301,10 @@ internal class LxManga(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		pageCache[chapterUrl]?.let {
+			log("getPages: cache hit ${chapterUrl.takeLast(40)} (${it.size} pages)")
+			return it
+		}
 		var lastError: Throwable? = null
 
 		repeat(2) { attempt ->
@@ -311,24 +319,32 @@ internal class LxManga(context: MangaLoaderContext) :
 					.optJSONObject("data")?.optString("manifestKid").orEmpty()
 				val actionToken = getActionToken(chapterUrl, csrf, kid, manifestKey)
 				if (actionToken == null) {
+					log("getPages: verification required for ${chapterUrl.takeLast(50)}")
 					throw VerificationRequiredException()
 				}
 				val urls = fetchImageManifest(chapterUrl, csrf, component, actionToken, manifestKey)
 				if (urls.isEmpty()) throw IOException("LXManga: manifest ảnh trống")
 				val encodedToken = context.encodeBase64(actionToken.toByteArray())
-				return urls.map { url ->
+				val pages = urls.map { url ->
 					val pageUrl = url.toHttpUrl().newBuilder()
 						.fragment("$TOKEN_MARKER$encodedToken")
 						.build()
 						.toString()
 					MangaPage(generateUid(url), pageUrl, null, source)
 				}
+				if (pageCache.size >= PAGE_CACHE_LIMIT) {
+					pageCache.remove(pageCache.keys.firstOrNull())
+				}
+				pageCache[chapterUrl] = pages
+				log("getPages: native ok ${chapterUrl.takeLast(40)} (${pages.size} pages)")
+				return pages
 			} catch (_: VerificationRequiredException) {
 				context.requestBrowserAction(this, chapterUrl)
 			} catch (e: CancellationException) {
 				throw e
 			} catch (e: Exception) {
 				lastError = e
+				log("getPages: attempt $attempt failed ${e.javaClass.simpleName}: ${e.message}")
 			}
 		}
 		throw lastError ?: IOException("LXManga: không tải được danh sách trang")
@@ -380,7 +396,10 @@ internal class LxManga(context: MangaLoaderContext) :
 			.build()
 		val response = webClient.httpGet(url, headers)
 		val body = response.body.string()
-		if (!response.isSuccessful) return null
+		val code = response.code
+		response.close()
+		log("get_token kid=${kid.take(8)} → HTTP $code ${body.take(120)}")
+		if (code !in 200..299) return null
 		val json = runCatching { JSONObject(body) }.getOrNull() ?: return null
 		if (json.optBoolean("is_bot", true)) return null
 		return json.optString("action_token").takeIf { it.isNotEmpty() }
@@ -544,6 +563,10 @@ internal class LxManga(context: MangaLoaderContext) :
 		private const val DEFAULT_ACCEPT_LANGUAGE = "vi-VN,vi;q=0.9,en;q=0.8"
 		private const val ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
 		private const val TOKEN_MARKER = "LXMANGA_TOKEN="
+		private const val PAGE_CACHE_LIMIT = 50
+		private const val SESSION_COOKIE = "lxmanga_session"
+
+		private val pageCache = LinkedHashMap<String, List<MangaPage>>()
 
 		private val GENRE_SLUG_REGEX = Regex("""toggleGenre\('([^']+)'\)""")
 		private val CSRF_REGEX = Regex("""var\s+csrf_token\s*=\s*'([^']+)'""")
