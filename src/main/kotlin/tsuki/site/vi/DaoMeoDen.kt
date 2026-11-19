@@ -241,7 +241,10 @@ internal class DaoMeoDen(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val url = chapter.url.toAbsoluteUrl(domain)
-		val apiChapterId = Regex("(?:chuong-|/)(\\d+)(?:-0)?\\.html$").find(chapter.url)?.groupValues?.get(1)?.toIntOrNull()
+		// New API chapter URLs are usually .../chuong-1-2126369-0
+		// (without .html). The API id is the second numeric component.
+		val apiChapterId = Regex("chuong-[\\d.]+-(\\d+)(?:-0)?(?:\\.html)?$")
+			.find(chapter.url.trimEnd('/'))?.groupValues?.get(1)?.toIntOrNull()
 		if (apiChapterId != null) {
 			val images = webClient.httpGet("$apiBaseUrl/api/chapters/$apiChapterId", apiHeaders(url)).parseJson()
 				.optJSONObject("data")?.optJSONArray("images")
