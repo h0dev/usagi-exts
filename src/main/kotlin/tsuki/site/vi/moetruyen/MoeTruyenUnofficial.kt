@@ -1,6 +1,10 @@
 package tsuki.site.vi.moetruyen
 
-import org.json.JSONArray
+import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import tsuki.MangaLoaderContext
@@ -9,7 +13,11 @@ import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
 import tsuki.exception.ParseException
 import tsuki.model.*
+import tsuki.network.CommonHeaders
 import tsuki.network.UserAgents
+import tsuki.site.vi.moetruyen.imgx.ImgxAccessClient
+import tsuki.site.vi.moetruyen.imgx.ImgxCrypto
+import tsuki.site.vi.moetruyen.imgx.ImgxGrant
 import tsuki.util.*
 import java.text.SimpleDateFormat
 import java.util.EnumSet
@@ -22,10 +30,39 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	override val configKeyDomain = ConfigKey.Domain("moetruyen.net")
 	override val userAgentKey = ConfigKey.UserAgent(UserAgents.KOTATSU)
 
+	private val imgxGrants = object : LinkedHashMap<String, Pair<ImgxGrant, String>>(100, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<ImgxGrant, String>>?): Boolean = size > 100
+	}
+
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.remove(userAgentKey)
 	}
+
+	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
+		.build()
+
+	private fun documentHeaders(): Headers = getRequestHeaders().newBuilder()
+		.set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
+		.set(CommonHeaders.SEC_FETCH_DEST, "document")
+		.set(CommonHeaders.SEC_FETCH_MODE, "navigate")
+		.set(CommonHeaders.SEC_FETCH_SITE, "same-origin")
+		.set(CommonHeaders.SEC_FETCH_USER, "?1")
+		.set(CommonHeaders.UPGRADE_INSECURE_REQUESTS, "1")
+		.build()
+
+	private fun xhrHeaders(chapterUrl: String): Headers = getRequestHeaders().newBuilder()
+		.set(CommonHeaders.ACCEPT, "*/*")
+		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
+		.set(CommonHeaders.ORIGIN, "https://$domain")
+		.set(CommonHeaders.REFERER, chapterUrl)
+		.set(CommonHeaders.SEC_FETCH_DEST, "empty")
+		.set(CommonHeaders.SEC_FETCH_MODE, "cors")
+		.set(CommonHeaders.SEC_FETCH_SITE, "same-origin")
+		.set("Priority", "u=1, i")
+		.build()
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -161,33 +198,45 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = normalizeSitePath(chapter.url).toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(chapterUrl).parseHtml()
-		val script = doc.select("script").firstOrNull { it.data().contains("worker.postMessage") }?.data()
-			?: throw ParseException("Không tìm thấy cấu hình ảnh của chương", chapter.url)
-		val mediaJson = MEDIA_REGEX.find(script)?.groupValues?.get(1)
-			?: throw ParseException("Không đọc được danh sách ảnh của chương", chapter.url)
-		val media = JSONArray(mediaJson)
+		val document = webClient.httpGet(chapterUrl, documentHeaders()).parseHtml()
+		val media = ImgxAccessClient.encryptedMedia(document)
+		val totalPages = document.selectFirst("[data-reader-lazy-pages]")
+			?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0
+		val pages = ImgxAccessClient(
+			webClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
+		).fetchPages(media, totalPages)
+			.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
+			.sortedBy { it.pageIndex }
 
-		// primaryUrl is not the manga image. It is a noisy PNG carrier whose RGB
-		// channels contain an encrypted IMGX payload. The keys are issued only to
-		// the official reader worker through a per-document capability. Returning
-		// that URL as MangaPage displays the carrier noise, so hand protected
-		// chapters to the site's reader instead.
-		if ((0 until media.length()).any { media.optJSONObject(it)?.has("primaryUrl") == true }) {
-			context.requestBrowserAction(this, chapterUrl)
+		if (pages.isEmpty()) throw ParseException("IMGX không trả về trang ảnh", chapter.url)
+		synchronized(imgxGrants) {
+			pages.forEach { page ->
+				val grant = page.grant ?: throw ParseException("IMGX thiếu khóa trang ${page.pageIndex + 1}", chapter.url)
+				imgxGrants[page.downloadUrl] = grant to page.storageKey
+			}
 		}
+		return pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
+	}
 
-		// Compatibility path for chapters that still expose ordinary image URLs.
-		val pages = (0 until media.length()).mapNotNull { i ->
-			val item = media.optJSONObject(i) ?: return@mapNotNull null
-			val url = item.optString("downloadUrl").takeIf {
-				it.startsWith("http") && !it.substringBefore('?').endsWith(".js")
-			} ?: return@mapNotNull null
-			Triple(item.optInt("pageNumber", i + 1), item.optInt("pageIndex", i), url)
-		}.sortedWith(compareBy<Triple<Int, Int, String>> { it.first }.thenBy { it.second })
-
-		if (pages.isEmpty()) throw ParseException("Chương yêu cầu trình đọc web IMGX", chapter.url)
-		return pages.map { (_, _, url) -> MangaPage(generateUid(url), url, null, source) }
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val request = chain.request()
+		val grantEntry = synchronized(imgxGrants) { imgxGrants[request.url.toString()] }
+			?: return super.intercept(chain)
+		val response = chain.proceed(request.newBuilder().header(CommonHeaders.ACCEPT_ENCODING, "identity").build())
+		val encrypted = response.body.use { it.bytes() }
+		if (encrypted.size <= 13 || !encrypted.copyOfRange(0, 4).contentEquals(
+			byteArrayOf(0x49.toByte(), 0x4D.toByte(), 0x47.toByte(), 0x58.toByte()),
+		)) {
+			return response.newBuilder().body(encrypted.toResponseBody(response.body.contentType())).build()
+		}
+		val webp = ImgxCrypto.decodeProtectedPage(encrypted, grantEntry.first, grantEntry.second)
+		return response.newBuilder()
+			.removeHeader(CommonHeaders.CONTENT_ENCODING)
+			.header(CommonHeaders.CONTENT_TYPE, "image/webp")
+			.header(CommonHeaders.CONTENT_LENGTH, webp.size.toString())
+			.header(CommonHeaders.CACHE_CONTROL, "no-cache, no-store")
+			.body(webp.toResponseBody("image/webp".toMediaType()))
+			.build()
 	}
 
 	private suspend fun resolveMangaUrl(manga: Manga): String {
@@ -251,6 +300,5 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	private companion object {
 		val ABSOLUTE_URL_REGEX = Regex("https?://([^/]+)(/.*)?", RegexOption.IGNORE_CASE)
 		val CHAPTER_PAGE_REGEX = Regex("[?&]chapterPage=(\\d+)")
-		val MEDIA_REGEX = Regex("media:\\s*(\\[.*?]),\\s*connection:", setOf(RegexOption.DOT_MATCHES_ALL))
 	}
 }
