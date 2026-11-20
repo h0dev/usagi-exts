@@ -271,7 +271,25 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 				delay(600L * (attempt + 1))
 			}
 		}
-		throw lastError ?: ParseException("IMGX không thể khởi tạo phiên đọc", chapter.url)
+		// Native handshake is refused by the server for this chapter: fall back to
+		// plain page URLs when the reader exposes them, otherwise hand the chapter
+		// to the official web reader instead of failing the reader screen.
+		val fallbackDocument = runCatching {
+			Jsoup.parse(imgxClient.httpGet(chapterUrl, documentHeaders()).parseRaw(), chapterUrl)
+		}.getOrNull()
+		val plain = fallbackDocument?.select("img.page-media")
+			?.mapNotNull { img -> img.attr("data-src").ifBlank { img.attr("src") } }
+			.orEmpty()
+			.filter { it.startsWith("http") && !it.substringBefore('?').endsWith(".js") }
+			.distinct()
+		if (plain.isNotEmpty()) {
+			println("[MoeTruyen] IMGX refused, using ${plain.size} plain pages")
+			return@withLock plain.map { MangaPage(generateUid(it), it, null, source) }
+				.also { pageCache[chapterUrl] = it }
+		}
+		println("[MoeTruyen] IMGX refused, opening web reader: ${lastError?.message}")
+		context.requestBrowserAction(this, chapterUrl)
+		throw ParseException("Chương này cần đọc bằng trình đọc web của Moè", chapter.url)
 	}
 
 	override fun intercept(chain: Interceptor.Chain): Response {
