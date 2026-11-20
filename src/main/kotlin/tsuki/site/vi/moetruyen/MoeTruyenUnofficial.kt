@@ -33,14 +33,6 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	override val configKeyDomain = ConfigKey.Domain("moetruyen.net")
 	override val userAgentKey = ConfigKey.UserAgent(UserAgents.KOTATSU)
 
-	private val imgxMutex = Mutex()
-	private val imgxGrants = object : LinkedHashMap<String, Pair<ImgxGrant, String>>(100, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<ImgxGrant, String>>?): Boolean = size > 100
-	}
-	private val pageCache = object : LinkedHashMap<String, List<MangaPage>>(12, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<MangaPage>>?): Boolean = size > 12
-	}
-
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.remove(userAgentKey)
@@ -305,6 +297,16 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	}
 
 	private companion object {
+		// Usagi creates more than one parser instance. The IMGX document cookie
+		// permits only one active reader-instance, so synchronization must be
+		// shared across instances rather than stored on a parser object.
+		val imgxMutex = Mutex()
+		val imgxGrants = object : LinkedHashMap<String, Pair<ImgxGrant, String>>(100, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<ImgxGrant, String>>?): Boolean = size > 100
+		}
+		val pageCache = object : LinkedHashMap<String, List<MangaPage>>(12, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<MangaPage>>?): Boolean = size > 12
+		}
 		val ABSOLUTE_URL_REGEX = Regex("https?://([^/]+)(/.*)?", RegexOption.IGNORE_CASE)
 		val CHAPTER_PAGE_REGEX = Regex("[?&]chapterPage=(\\d+)")
 	}
