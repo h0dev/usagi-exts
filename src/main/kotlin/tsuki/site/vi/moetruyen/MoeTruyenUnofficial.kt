@@ -113,8 +113,9 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 			.mapNotNull { CHAPTER_PAGE_REGEX.find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull() }
 			.maxOrNull() ?: 1
 		for (page in 2..lastPage) {
-			val pageUrl = urlBuilder(relativeUrl.toAbsoluteUrl(domain))
-				.addQueryParameter("chapterPage", page.toString()).build()
+			// urlBuilder(String) expects a host, not a complete URL. Passing the
+			// absolute manga URL made OkHttp reject it as an "unexpected host".
+			val pageUrl = "${relativeUrl.toAbsoluteUrl(domain)}?chapterPage=$page"
 			chapterDocs += webClient.httpGet(pageUrl).parseHtml()
 		}
 
@@ -159,30 +160,43 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+		val chapterUrl = normalizeSitePath(chapter.url).toAbsoluteUrl(domain)
+		val doc = webClient.httpGet(chapterUrl).parseHtml()
 		val script = doc.select("script").firstOrNull { it.data().contains("worker.postMessage") }?.data()
 			?: throw ParseException("Không tìm thấy cấu hình ảnh của chương", chapter.url)
 		val mediaJson = MEDIA_REGEX.find(script)?.groupValues?.get(1)
 			?: throw ParseException("Không đọc được danh sách ảnh của chương", chapter.url)
 		val media = JSONArray(mediaJson)
+
+		// primaryUrl is not the manga image. It is a noisy PNG carrier whose RGB
+		// channels contain an encrypted IMGX payload. The keys are issued only to
+		// the official reader worker through a per-document capability. Returning
+		// that URL as MangaPage displays the carrier noise, so hand protected
+		// chapters to the site's reader instead.
+		if ((0 until media.length()).any { media.optJSONObject(it)?.has("primaryUrl") == true }) {
+			context.requestBrowserAction(this, chapterUrl)
+		}
+
+		// Compatibility path for chapters that still expose ordinary image URLs.
 		val pages = (0 until media.length()).mapNotNull { i ->
 			val item = media.optJSONObject(i) ?: return@mapNotNull null
-			val url = item.optString("primaryUrl").takeIf { it.startsWith("http") } ?: return@mapNotNull null
+			val url = item.optString("downloadUrl").takeIf {
+				it.startsWith("http") && !it.substringBefore('?').endsWith(".js")
+			} ?: return@mapNotNull null
 			Triple(item.optInt("pageNumber", i + 1), item.optInt("pageIndex", i), url)
 		}.sortedWith(compareBy<Triple<Int, Int, String>> { it.first }.thenBy { it.second })
 
-		if (pages.isEmpty()) {
-			throw ParseException("Chương không có ảnh CDN trực tiếp", chapter.url)
-		}
-		return pages.map { (_, _, url) ->
-			MangaPage(generateUid(url), url, null, source)
-		}
+		if (pages.isEmpty()) throw ParseException("Chương yêu cầu trình đọc web IMGX", chapter.url)
+		return pages.map { (_, _, url) -> MangaPage(generateUid(url), url, null, source) }
 	}
 
 	private suspend fun resolveMangaUrl(manga: Manga): String {
-		if (manga.url.startsWith("/manga/")) return manga.url
-		val oldId = manga.url.substringAfterLast('/').toLongOrNull()
-			?: return manga.url.toRelativeUrl(domain)
+		val normalized = normalizeSitePath(manga.url)
+		if (normalized.startsWith("/manga/") &&
+			normalized.removePrefix("/manga/").substringBefore('/').toLongOrNull() == null
+		) return normalized
+		val oldId = normalized.removePrefix("/manga/").substringBefore('/').toLongOrNull()
+			?: return normalized
 		val url = urlBuilder().addPathSegment("search")
 			.addQueryParameter("q", oldId.toString())
 			.addQueryParameter("limit", "20").build()
@@ -193,6 +207,28 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 			if (item.optLong("id") == oldId) return "/manga/${item.getString("slug")}"
 		}
 		throw ParseException("Không tìm được slug mới cho ${manga.title}", manga.url)
+	}
+
+	private fun normalizeSitePath(value: String): String {
+		val raw = value.trim()
+		val absolute = ABSOLUTE_URL_REGEX.matchEntire(raw)
+		val path = if (absolute != null) {
+			val host = absolute.groupValues[1]
+			if (!host.equals(domain, ignoreCase = true)) {
+				throw ParseException("URL không thuộc $domain", value)
+			}
+			absolute.groupValues[2]
+		} else {
+			raw
+		}
+		val clean = path.substringBefore('#').substringBefore('?').trim()
+			.replace(Regex("\\s+"), "-")
+			.replace(Regex("-{2,}"), "-")
+		return when {
+			clean.startsWith('/') -> clean
+			clean.startsWith("manga/") -> "/$clean"
+			else -> clean
+		}
 	}
 
 	private suspend fun availableTags(): Set<MangaTag> =
@@ -213,6 +249,7 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	}
 
 	private companion object {
+		val ABSOLUTE_URL_REGEX = Regex("https?://([^/]+)(/.*)?", RegexOption.IGNORE_CASE)
 		val CHAPTER_PAGE_REGEX = Regex("[?&]chapterPage=(\\d+)")
 		val MEDIA_REGEX = Regex("media:\\s*(\\[.*?]),\\s*connection:", setOf(RegexOption.DOT_MATCHES_ALL))
 	}
