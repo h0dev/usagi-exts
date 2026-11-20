@@ -1,5 +1,6 @@
 package tsuki.site.vi.moetruyen
 
+import kotlinx.coroutines.delay
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -153,6 +154,8 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 			// urlBuilder(String) expects a host, not a complete URL. Passing the
 			// absolute manga URL made OkHttp reject it as an "unexpected host".
 			val pageUrl = "${relativeUrl.toAbsoluteUrl(domain)}?chapterPage=$page"
+			// The site rate-limits burst document requests and may answer 500.
+			delay(350)
 			chapterDocs += webClient.httpGet(pageUrl).parseHtml()
 		}
 
