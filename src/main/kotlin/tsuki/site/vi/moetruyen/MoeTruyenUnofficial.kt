@@ -87,16 +87,40 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		.set(CommonHeaders.UPGRADE_INSECURE_REQUESTS, "1")
 		.build()
 
-	private fun xhrHeaders(chapterUrl: String): Headers = getRequestHeaders().newBuilder()
-		.set(CommonHeaders.ACCEPT, "*/*")
-		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
-		.set(CommonHeaders.ORIGIN, "https://$domain")
-		.set(CommonHeaders.REFERER, chapterUrl)
-		.set(CommonHeaders.SEC_FETCH_DEST, "empty")
-		.set(CommonHeaders.SEC_FETCH_MODE, "cors")
-		.set(CommonHeaders.SEC_FETCH_SITE, "same-origin")
-		.set("Priority", "u=1, i")
-		.build()
+	/**
+	 * The IMGX endpoints answer 500 ("Đã xảy ra lỗi hệ thống") to some
+	 * header combinations, and which ones are rejected differs per client and
+	 * per chapter. Try the exact set the official worker sends first, then the
+	 * browser-shaped set, then a Chrome-identity variant.
+	 */
+	private fun requestHeaderVariants(chapterUrl: String): List<Headers> {
+		val base = getRequestHeaders().newBuilder()
+			.set(CommonHeaders.ORIGIN, "https://$domain")
+			.set(CommonHeaders.REFERER, chapterUrl)
+			.build()
+		val official = base.newBuilder()
+			.set(CommonHeaders.ACCEPT, "application/json")
+			.set(CommonHeaders.CONTENT_TYPE, "application/json")
+			.set(CommonHeaders.ACCEPT_ENCODING, "identity")
+			.build()
+		val browser = base.newBuilder()
+			.set(CommonHeaders.ACCEPT, "*/*")
+			.set(CommonHeaders.ACCEPT_ENCODING, "identity")
+			.set(CommonHeaders.SEC_FETCH_DEST, "empty")
+			.set(CommonHeaders.SEC_FETCH_MODE, "cors")
+			.set(CommonHeaders.SEC_FETCH_SITE, "same-origin")
+			.set("Priority", "u=1, i")
+			.build()
+		val chromeUserAgent = UserAgents.CHROME_MOBILE
+		val chrome = browser.newBuilder()
+			.set(CommonHeaders.USER_AGENT, chromeUserAgent)
+			.set(CommonHeaders.ACCEPT_LANGUAGE, "vi-VN,vi;q=0.9,en;q=0.8")
+			.set(CommonHeaders.SEC_CH_UA, "\"Chromium\";v=\"144\", \"Not=A?Brand\";v=\"24\"")
+			.set(CommonHeaders.SEC_CH_UA_MOBILE, "?1")
+			.set(CommonHeaders.SEC_CH_UA_PLATFORM, "\"Android\"")
+			.build()
+		return listOf(official, browser, chrome)
+	}
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
@@ -236,39 +260,51 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		val chapterUrl = normalizeSitePath(chapter.url).toAbsoluteUrl(domain)
 		pageCache[chapterUrl]?.let { return@withLock it }
 		var lastError: Throwable? = null
-		repeat(3) { attempt ->
+		val variants = requestHeaderVariants(chapterUrl)
+		repeat(2) { round ->
 			try {
 				imgxCookieJar.clear()
 				val html = imgxClient.httpGet(chapterUrl, documentHeaders()).parseRaw()
 				val document = Jsoup.parse(html, chapterUrl)
-				println("[MoeTruyen] chapter ${chapterUrl.substringAfter("$domain")}")
 				println(
-					"[MoeTruyen] attempt $attempt document ${html.length}B cookies=" +
-						imgxCookieJar.loadForRequest(chapterUrl.toHttpUrl()).joinToString(",") { it.name } +
+					"[MoeTruyen] round $round ${chapterUrl.substringAfter("$domain")} doc=${html.length}B " +
+						"cookies=" + imgxCookieJar.loadForRequest(chapterUrl.toHttpUrl()).joinToString(",") { it.name } +
 						" token=" + html.contains("reader-instance"),
 				)
 				val media = ImgxAccessClient.encryptedMedia(document)
 				val totalPages = document.selectFirst("[data-reader-lazy-pages]")
 					?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0
-				val pages = ImgxAccessClient(
-					imgxClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
-				).fetchPages(media, totalPages)
-					.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
-					.sortedBy { it.pageIndex }
-				if (pages.isEmpty()) throw ParseException("IMGX không trả về trang ảnh", chapter.url)
-				synchronized(imgxGrants) {
-					pages.forEach { page ->
-						val grant = page.grant ?: throw ParseException("IMGX thiếu khóa trang ${page.pageIndex + 1}", chapter.url)
-						imgxGrants[page.downloadUrl] = grant to page.storageKey
+				for (variant in variants.indices) {
+					val pages = try {
+						ImgxAccessClient(
+							imgxClient, "https://$domain", chapterUrl, document, variants, variant,
+						).fetchPages(media, totalPages)
+					} catch (e: HttpStatusException) {
+						lastError = e
+						println("[MoeTruyen] variant $variant HTTP ${e.statusCode}")
+						continue
 					}
+					val usable = pages
+						.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
+						.sortedBy { it.pageIndex }
+					if (usable.isEmpty()) continue
+					println("[MoeTruyen] variant $variant ok, ${usable.size} pages")
+					synchronized(imgxGrants) {
+						usable.forEach { page ->
+							val grant = page.grant ?: return@synchronized
+							imgxGrants[page.downloadUrl] = grant to page.storageKey
+						}
+					}
+					return@withLock usable.map { page ->
+						MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source)
+					}.also { pageCache[chapterUrl] = it }
 				}
-				return@withLock pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
-					.also { pageCache[chapterUrl] = it }
+				delay(700L * (round + 1))
 			} catch (e: HttpStatusException) {
 				lastError = e
-				println("[MoeTruyen] attempt $attempt failed HTTP ${e.statusCode} ${e.url.takeLast(60)}")
-				if (e.statusCode !in setOf(403, 429, 500, 502, 503, 504) || attempt == 2) throw e
-				delay(600L * (attempt + 1))
+				println("[MoeTruyen] round $round document HTTP ${e.statusCode}")
+				if (e.statusCode !in setOf(403, 429, 500, 502, 503, 504)) throw e
+				delay(700L * (round + 1))
 			}
 		}
 		// Native handshake is refused by the server for this chapter: fall back to

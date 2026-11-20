@@ -17,7 +17,8 @@ internal class ImgxAccessClient(
 	private val baseUrl: String,
 	private val chapterUrl: String,
 	private val document: Document,
-	private val xhrHeaders: Headers,
+	private val headerVariants: List<Headers>,
+	private val variant: Int = 0,
 ) {
 	private val keyPair = ImgxCrypto.generateEcdhP256()
 	private var sequence = 0L
@@ -47,10 +48,10 @@ internal class ImgxAccessClient(
 			client.httpPost(
 				"$baseUrl${config.bootstrapUrl}".toHttpUrl(),
 				JSONObject().put("readerPublicKey", keyPair.publicKey).put("bootstrapProof", bootstrapProof)
-					.put("initialPageIndexes", JSONArray(initialIndexes)), xhrHeaders,
+					.put("initialPageIndexes", JSONArray(initialIndexes)), headerVariants[variant],
 			).use { JSONObject(it.body.string()) }
 		} catch (e: HttpStatusException) {
-			println("[MoeTruyen] bootstrap HTTP ${e.statusCode}")
+			println("[MoeTruyen] bootstrap HTTP ${e.statusCode} variant=$variant")
 			throw e
 		}
 		println("[MoeTruyen] bootstrap ok, reader=${bootstrap.optString("readerInstanceId").take(8)}")
@@ -85,7 +86,7 @@ internal class ImgxAccessClient(
 				client.httpPost(
 					"$baseUrl${config.requestPath}".toHttpUrl(),
 					JSONObject().put("pageIndexes", JSONArray(batch)).put("pageAccessProof", proof)
-						.put("readerPublicKey", keyPair.publicKey), xhrHeaders,
+						.put("readerPublicKey", keyPair.publicKey), headerVariants[variant],
 				).use { JSONObject(it.body.string()) }
 			} catch (e: HttpStatusException) {
 				println("[MoeTruyen] page-access HTTP ${e.statusCode} batch=${batch.size}")
