@@ -4,6 +4,7 @@ import kotlinx.coroutines.delay
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
+import org.jsoup.HttpStatusException
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import tsuki.network.WebClient
@@ -35,11 +36,17 @@ internal class ImgxAccessClient(
 
 		val bootstrapProof = ImgxCrypto.base64UrlEncode(ImgxCrypto.randomBytes(32))
 		paceAccess()
-		val bootstrap = client.httpPost(
-			"$baseUrl${config.bootstrapUrl}".toHttpUrl(),
-			JSONObject().put("readerPublicKey", keyPair.publicKey).put("bootstrapProof", bootstrapProof)
-				.put("initialPageIndexes", JSONArray(config.initialIndexes)), xhrHeaders,
-		).use { JSONObject(it.body.string()) }
+		val bootstrap = try {
+			client.httpPost(
+				"$baseUrl${config.bootstrapUrl}".toHttpUrl(),
+				JSONObject().put("readerPublicKey", keyPair.publicKey).put("bootstrapProof", bootstrapProof)
+					.put("initialPageIndexes", JSONArray(config.initialIndexes)), xhrHeaders,
+			).use { JSONObject(it.body.string()) }
+		} catch (e: HttpStatusException) {
+			println("[MoeTruyen] bootstrap HTTP ${e.statusCode}")
+			throw e
+		}
+		println("[MoeTruyen] bootstrap ok, reader=${bootstrap.optString("readerInstanceId").take(8)}")
 		require(bootstrap.optBoolean("ok") && bootstrap.has("sealedCapability")) {
 			"IMGX bootstrap failed: ${bootstrap.optString("code", "unknown")}"
 		}
@@ -67,11 +74,16 @@ internal class ImgxAccessClient(
 				.put("readerInstanceId", capability.readerInstanceId).put("issuedAt", issuedAt)
 				.put("sequence", sequence).put("proof", signature)
 			paceAccess()
-			val response = client.httpPost(
-				"$baseUrl${config.requestPath}".toHttpUrl(),
-				JSONObject().put("pageIndexes", JSONArray(batch)).put("pageAccessProof", proof)
-					.put("readerPublicKey", keyPair.publicKey), xhrHeaders,
-			).use { JSONObject(it.body.string()) }
+			val response = try {
+				client.httpPost(
+					"$baseUrl${config.requestPath}".toHttpUrl(),
+					JSONObject().put("pageIndexes", JSONArray(batch)).put("pageAccessProof", proof)
+						.put("readerPublicKey", keyPair.publicKey), xhrHeaders,
+				).use { JSONObject(it.body.string()) }
+			} catch (e: HttpStatusException) {
+				println("[MoeTruyen] page-access HTTP ${e.statusCode} batch=${batch.size}")
+				throw e
+			}
 			require(response.optBoolean("ok") && response.has("sealedPages")) {
 				"IMGX page access failed: ${response.optString("code", "unknown")}"
 			}

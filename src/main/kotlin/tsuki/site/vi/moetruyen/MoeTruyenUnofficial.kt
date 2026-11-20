@@ -9,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.HttpStatusException
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import tsuki.MangaLoaderContext
@@ -18,8 +19,10 @@ import tsuki.core.PagedMangaParser
 import tsuki.exception.ParseException
 import tsuki.model.*
 import tsuki.network.CommonHeaders
+import tsuki.network.OkHttpWebClient
 import tsuki.network.UserAgents
 import tsuki.site.vi.moetruyen.imgx.ImgxAccessClient
+import tsuki.site.vi.moetruyen.imgx.MemoryCookieJar
 import tsuki.site.vi.moetruyen.imgx.ImgxCrypto
 import tsuki.site.vi.moetruyen.imgx.ImgxGrant
 import tsuki.util.*
@@ -37,6 +40,25 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.remove(userAgentKey)
+	}
+
+	/**
+	 * The IMGX handshake needs the document, the bootstrap and the page-access
+	 * calls to share one cookie jar, and that jar must not contain leftovers from
+	 * the app's WebView session: the reader-instance token is validated against
+	 * the `imgx_document` cookie of the response that produced it. With the shared
+	 * jar the server rejects the pairing and answers 5xx, which the app shows as
+	 * "Lỗi server (500)".
+	 */
+	private val imgxCookieJar = MemoryCookieJar()
+	private val imgxClient by lazy {
+		OkHttpWebClient(
+			context.httpClient.newBuilder()
+				.cookieJar(imgxCookieJar)
+				.cache(null)
+				.build(),
+			source,
+		)
 	}
 
 	private fun documentHeaders(): Headers = getRequestHeaders().newBuilder()
@@ -200,12 +222,15 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		var lastError: Throwable? = null
 		repeat(3) { attempt ->
 			try {
-				val document = webClient.httpGet(chapterUrl, documentHeaders()).parseHtml()
+				imgxCookieJar.clear()
+				val html = imgxClient.httpGet(chapterUrl, documentHeaders()).parseRaw()
+				val document = Jsoup.parse(html, chapterUrl)
+				println("[MoeTruyen] attempt $attempt document ${html.length}B")
 				val media = ImgxAccessClient.encryptedMedia(document)
 				val totalPages = document.selectFirst("[data-reader-lazy-pages]")
 					?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0
 				val pages = ImgxAccessClient(
-					webClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
+					imgxClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
 				).fetchPages(media, totalPages)
 					.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
 					.sortedBy { it.pageIndex }
@@ -220,6 +245,7 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 					.also { pageCache[chapterUrl] = it }
 			} catch (e: HttpStatusException) {
 				lastError = e
+				println("[MoeTruyen] attempt $attempt failed HTTP ${e.statusCode} ${e.url.takeLast(60)}")
 				if (e.statusCode !in setOf(403, 429, 500, 502, 503, 504) || attempt == 2) throw e
 				delay(600L * (attempt + 1))
 			}
@@ -232,6 +258,9 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		val grantEntry = synchronized(imgxGrants) { imgxGrants[request.url.toString()] }
 			?: return super.intercept(chain)
 		val response = chain.proceed(request.newBuilder().header(CommonHeaders.ACCEPT_ENCODING, "identity").build())
+		if (!response.isSuccessful) {
+			println("[MoeTruyen] image HTTP ${response.code} ${request.url.toString().takeLast(48)}")
+		}
 		val encrypted = response.body.use { it.bytes() }
 		if (encrypted.size <= 13 || !encrypted.copyOfRange(0, 4).contentEquals(
 			byteArrayOf(0x49.toByte(), 0x4D.toByte(), 0x47.toByte(), 0x58.toByte()),
