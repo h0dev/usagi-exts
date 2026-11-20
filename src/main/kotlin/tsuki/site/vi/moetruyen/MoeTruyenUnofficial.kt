@@ -1,6 +1,8 @@
 package tsuki.site.vi.moetruyen
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -31,8 +33,12 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	override val configKeyDomain = ConfigKey.Domain("moetruyen.net")
 	override val userAgentKey = ConfigKey.UserAgent(UserAgents.KOTATSU)
 
+	private val imgxMutex = Mutex()
 	private val imgxGrants = object : LinkedHashMap<String, Pair<ImgxGrant, String>>(100, 0.75f, true) {
 		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<ImgxGrant, String>>?): Boolean = size > 100
+	}
+	private val pageCache = object : LinkedHashMap<String, List<MangaPage>>(12, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<MangaPage>>?): Boolean = size > 12
 	}
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -195,8 +201,9 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		)
 	}
 
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = imgxMutex.withLock {
 		val chapterUrl = normalizeSitePath(chapter.url).toAbsoluteUrl(domain)
+		pageCache[chapterUrl]?.let { return@withLock it }
 		val document = webClient.httpGet(chapterUrl, documentHeaders()).parseHtml()
 		val media = ImgxAccessClient.encryptedMedia(document)
 		val totalPages = document.selectFirst("[data-reader-lazy-pages]")
@@ -214,7 +221,8 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 				imgxGrants[page.downloadUrl] = grant to page.storageKey
 			}
 		}
-		return pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
+		pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
+			.also { pageCache[chapterUrl] = it }
 	}
 
 	override fun intercept(chain: Interceptor.Chain): Response {
