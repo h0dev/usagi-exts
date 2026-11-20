@@ -4,6 +4,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Response
@@ -52,11 +53,26 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	 */
 	private val imgxCookieJar = MemoryCookieJar()
 	private val imgxClient by lazy {
+		val logging = Interceptor { chain ->
+			val response = chain.proceed(chain.request())
+			if (response.isSuccessful) {
+				response
+			} else {
+				val body = response.body
+				val bytes = body.bytes()
+				println(
+					"[MoeTruyen] ${chain.request().url.encodedPath.takeLast(40)} -> ${response.code} " +
+						String(bytes, Charsets.UTF_8).replace('\n', ' ').take(240),
+				)
+				response.newBuilder().body(bytes.toResponseBody(body.contentType())).build()
+			}
+		}
+		val client = context.httpClient.newBuilder()
+			.cookieJar(imgxCookieJar)
+			.cache(null)
+			.build()
 		OkHttpWebClient(
-			context.httpClient.newBuilder()
-				.cookieJar(imgxCookieJar)
-				.cache(null)
-				.build(),
+			client.newBuilder().addInterceptor(logging).build(),
 			source,
 		)
 	}
@@ -225,7 +241,12 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 				imgxCookieJar.clear()
 				val html = imgxClient.httpGet(chapterUrl, documentHeaders()).parseRaw()
 				val document = Jsoup.parse(html, chapterUrl)
-				println("[MoeTruyen] attempt $attempt document ${html.length}B")
+				println("[MoeTruyen] chapter ${chapterUrl.substringAfter("$domain")}")
+				println(
+					"[MoeTruyen] attempt $attempt document ${html.length}B cookies=" +
+						imgxCookieJar.loadForRequest(chapterUrl.toHttpUrl()).joinToString(",") { it.name } +
+						" token=" + html.contains("reader-instance"),
+				)
 				val media = ImgxAccessClient.encryptedMedia(document)
 				val totalPages = document.selectFirst("[data-reader-lazy-pages]")
 					?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0

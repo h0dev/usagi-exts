@@ -34,13 +34,20 @@ internal class ImgxAccessClient(
 		val indexes = if (media.isNotEmpty()) media.map { it.pageIndex } else (0 until totalPages).toList()
 		require(config.bootstrapUrl.isNotBlank()) { "IMGX document capability missing" }
 
+		// The HTML advertises a sentinel page ("0.js") for the fingerprint carrier.
+		// Requesting it is optional: the server answers 500 when the index has no
+		// media in the document (it varies per chapter and per served variant), so
+		// only hand over indexes that really exist and fetch the rest in batches.
+		val initialIndexes = config.initialIndexes.filter { index -> media.any { it.pageIndex == index } }
+		println("[MoeTruyen] initial ${config.initialIndexes} -> $initialIndexes, media=${media.size}")
+
 		val bootstrapProof = ImgxCrypto.base64UrlEncode(ImgxCrypto.randomBytes(32))
 		paceAccess()
 		val bootstrap = try {
 			client.httpPost(
 				"$baseUrl${config.bootstrapUrl}".toHttpUrl(),
 				JSONObject().put("readerPublicKey", keyPair.publicKey).put("bootstrapProof", bootstrapProof)
-					.put("initialPageIndexes", JSONArray(config.initialIndexes)), xhrHeaders,
+					.put("initialPageIndexes", JSONArray(initialIndexes)), xhrHeaders,
 			).use { JSONObject(it.body.string()) }
 		} catch (e: HttpStatusException) {
 			println("[MoeTruyen] bootstrap HTTP ${e.statusCode}")
