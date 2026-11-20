@@ -40,10 +40,6 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		keys.remove(userAgentKey)
 	}
 
-	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
-		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
-		.build()
-
 	private fun documentHeaders(): Headers = getRequestHeaders().newBuilder()
 		.set(CommonHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		.set(CommonHeaders.ACCEPT_ENCODING, "identity")
