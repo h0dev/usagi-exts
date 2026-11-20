@@ -8,6 +8,7 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import org.jsoup.HttpStatusException
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import tsuki.MangaLoaderContext
@@ -196,25 +197,34 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> = imgxMutex.withLock {
 		val chapterUrl = normalizeSitePath(chapter.url).toAbsoluteUrl(domain)
 		pageCache[chapterUrl]?.let { return@withLock it }
-		val document = webClient.httpGet(chapterUrl, documentHeaders()).parseHtml()
-		val media = ImgxAccessClient.encryptedMedia(document)
-		val totalPages = document.selectFirst("[data-reader-lazy-pages]")
-			?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0
-		val pages = ImgxAccessClient(
-			webClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
-		).fetchPages(media, totalPages)
-			.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
-			.sortedBy { it.pageIndex }
-
-		if (pages.isEmpty()) throw ParseException("IMGX không trả về trang ảnh", chapter.url)
-		synchronized(imgxGrants) {
-			pages.forEach { page ->
-				val grant = page.grant ?: throw ParseException("IMGX thiếu khóa trang ${page.pageIndex + 1}", chapter.url)
-				imgxGrants[page.downloadUrl] = grant to page.storageKey
+		var lastError: Throwable? = null
+		repeat(3) { attempt ->
+			try {
+				val document = webClient.httpGet(chapterUrl, documentHeaders()).parseHtml()
+				val media = ImgxAccessClient.encryptedMedia(document)
+				val totalPages = document.selectFirst("[data-reader-lazy-pages]")
+					?.attr("data-reader-total-pages")?.toIntOrNull() ?: 0
+				val pages = ImgxAccessClient(
+					webClient, "https://$domain", chapterUrl, document, xhrHeaders(chapterUrl),
+				).fetchPages(media, totalPages)
+					.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
+					.sortedBy { it.pageIndex }
+				if (pages.isEmpty()) throw ParseException("IMGX không trả về trang ảnh", chapter.url)
+				synchronized(imgxGrants) {
+					pages.forEach { page ->
+						val grant = page.grant ?: throw ParseException("IMGX thiếu khóa trang ${page.pageIndex + 1}", chapter.url)
+						imgxGrants[page.downloadUrl] = grant to page.storageKey
+					}
+				}
+				return@withLock pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
+					.also { pageCache[chapterUrl] = it }
+			} catch (e: HttpStatusException) {
+				lastError = e
+				if (e.statusCode !in setOf(403, 429, 500, 502, 503, 504) || attempt == 2) throw e
+				delay(600L * (attempt + 1))
 			}
 		}
-		pages.map { page -> MangaPage(generateUid(page.downloadUrl), page.downloadUrl, null, source) }
-			.also { pageCache[chapterUrl] = it }
+		throw lastError ?: ParseException("IMGX không thể khởi tạo phiên đọc", chapter.url)
 	}
 
 	override fun intercept(chain: Interceptor.Chain): Response {
