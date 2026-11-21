@@ -25,7 +25,7 @@ internal class ImgxAccessClient(
 	private var lastAccessAt = 0L
 
 	private suspend fun paceAccess() {
-		val wait = 340L - (System.currentTimeMillis() - lastAccessAt)
+		val wait = PACE_MS - (System.currentTimeMillis() - lastAccessAt)
 		if (wait > 0) delay(wait)
 		lastAccessAt = System.currentTimeMillis()
 	}
@@ -104,6 +104,9 @@ internal class ImgxAccessClient(
 
 	companion object {
 		private const val PROOF_VERSION = "imgx-page-access-proof-v3"
+
+		/** The reader API allows 20 requests per second; a small gap avoids bursts. */
+		private const val PACE_MS = 120L
 
 		fun parseBootstrapConfig(document: Document): ReaderBootstrapConfig {
 			val text = document.select("script").joinToString("\n") { it.data() } + "\n" + document.html()

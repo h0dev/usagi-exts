@@ -56,9 +56,6 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	private val imgxClient by lazy {
 		val logging = Interceptor { chain ->
 			val sent = chain.request()
-			if (sent.method == "GET") {
-				println("[MoeTruyen] doc headers ${sent.headers.names().sorted()}")
-			}
 			val response = chain.proceed(sent)
 			if (response.isSuccessful) {
 				response
@@ -106,28 +103,28 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 			.set(CommonHeaders.ORIGIN, "https://$domain")
 			.set(CommonHeaders.REFERER, chapterUrl)
 			.build()
-		val official = base.newBuilder()
+		// First choice: the fetch-metadata set a same-origin XHR sends. Without
+		// these the site rejects the call with reader_origin_rejected.
+		val browser = base.newBuilder()
 			.set(CommonHeaders.ACCEPT, "application/json")
 			.set(CommonHeaders.CONTENT_TYPE, "application/json")
-			.set(CommonHeaders.ACCEPT_ENCODING, "identity")
-			.build()
-		val browser = base.newBuilder()
-			.set(CommonHeaders.ACCEPT, "*/*")
 			.set(CommonHeaders.ACCEPT_ENCODING, "identity")
 			.set(CommonHeaders.SEC_FETCH_DEST, "empty")
 			.set(CommonHeaders.SEC_FETCH_MODE, "cors")
 			.set(CommonHeaders.SEC_FETCH_SITE, "same-origin")
 			.set("Priority", "u=1, i")
 			.build()
-		val chromeUserAgent = UserAgents.CHROME_MOBILE
+		val wildcard = browser.newBuilder()
+			.set(CommonHeaders.ACCEPT, "*/*")
+			.build()
 		val chrome = browser.newBuilder()
-			.set(CommonHeaders.USER_AGENT, chromeUserAgent)
+			.set(CommonHeaders.USER_AGENT, UserAgents.CHROME_MOBILE)
 			.set(CommonHeaders.ACCEPT_LANGUAGE, "vi-VN,vi;q=0.9,en;q=0.8")
 			.set(CommonHeaders.SEC_CH_UA, "\"Chromium\";v=\"144\", \"Not=A?Brand\";v=\"24\"")
 			.set(CommonHeaders.SEC_CH_UA_MOBILE, "?1")
 			.set(CommonHeaders.SEC_CH_UA_PLATFORM, "\"Android\"")
 			.build()
-		return listOf(official, browser, chrome)
+		return listOf(browser, wildcard, chrome)
 	}
 
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
@@ -272,6 +269,7 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 		repeat(2) { round ->
 			try {
 				imgxCookieJar.clear()
+				val started = System.currentTimeMillis()
 				val html = imgxClient.httpGet(chapterUrl, documentHeaders()).parseRaw()
 				val document = Jsoup.parse(html, chapterUrl)
 				println(
@@ -296,7 +294,7 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 						.filter { it.storageKey.startsWith("chapters/") && !it.downloadUrl.substringBefore('?').endsWith("/0.js") }
 						.sortedBy { it.pageIndex }
 					if (usable.isEmpty()) continue
-					println("[MoeTruyen] variant $variant ok, ${usable.size} pages")
+					println("[MoeTruyen] variant $variant ok, ${usable.size} pages in ${System.currentTimeMillis() - started}ms")
 					synchronized(imgxGrants) {
 						usable.forEach { page ->
 							val grant = page.grant ?: return@synchronized
