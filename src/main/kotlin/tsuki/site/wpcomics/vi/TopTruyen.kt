@@ -2,11 +2,14 @@ package tsuki.site.wpcomics.vi
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.model.*
+import tsuki.network.CommonHeaders
 import tsuki.site.wpcomics.WpComicsParser
 import tsuki.util.*
 import java.net.URI
@@ -18,10 +21,6 @@ internal class TopTruyen(context: MangaLoaderContext) :
 	WpComicsParser(context, MangaParserSource.TOPTRUYEN, DOMAIN_DISCOVERY_HOST, 36) {
 
 	override val configKeyDomain = ConfigKey.Domain(DOMAIN_DISCOVERY_HOST)
-
-	@Volatile
-	private var resolvedDomain: String? = null
-	private val domainMutex = Mutex()
 
 	private suspend fun currentDomain(): String {
 		resolvedDomain?.let { return it }
@@ -45,6 +44,18 @@ internal class TopTruyen(context: MangaLoaderContext) :
 			return URI("https", uri.userInfo, host, -1, uri.path, uri.query, uri.fragment).toString()
 		}
 		return url.toAbsoluteUrl(currentDomain())
+	}
+
+	override fun intercept(chain: Interceptor.Chain): Response {
+		val request = chain.request()
+		if (!request.url.host.endsWith(IMAGE_CDN_SUFFIX)) return super.intercept(chain)
+
+		val refererHost = resolvedDomain ?: DOMAIN_DISCOVERY_HOST
+		return chain.proceed(
+			request.newBuilder()
+				.header(CommonHeaders.REFERER, "https://$refererHost/")
+				.build(),
+		)
 	}
 
 	override val datePattern = "dd/MM/yyyy"
@@ -288,6 +299,11 @@ internal class TopTruyen(context: MangaLoaderContext) :
 
 	private companion object {
 		const val DOMAIN_DISCOVERY_HOST = "toptruyen279.online"
+		const val IMAGE_CDN_SUFFIX = ".anhvip.xyz"
+		val domainMutex = Mutex()
+
+		@Volatile
+		var resolvedDomain: String? = null
 	}
 
 	private fun availableTags(): Set<MangaTag> = setOf(
