@@ -79,7 +79,7 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 			.cookieJar(imgxCookieJar)
 			.cache(null)
 			.followRedirects(true)
-			.callTimeout(java.time.Duration.ofSeconds(45))
+			.callTimeout(45, java.util.concurrent.TimeUnit.SECONDS)
 			.addInterceptor(logging)
 			.build()
 		OkHttpWebClient(client, source)
