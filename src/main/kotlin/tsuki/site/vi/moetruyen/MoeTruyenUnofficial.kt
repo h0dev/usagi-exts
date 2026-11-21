@@ -7,6 +7,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.HttpStatusException
@@ -54,7 +55,11 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 	private val imgxCookieJar = MemoryCookieJar()
 	private val imgxClient by lazy {
 		val logging = Interceptor { chain ->
-			val response = chain.proceed(chain.request())
+			val sent = chain.request()
+			if (sent.method == "GET") {
+				println("[MoeTruyen] doc headers ${sent.headers.names().sorted()}")
+			}
+			val response = chain.proceed(sent)
 			if (response.isSuccessful) {
 				response
 			} else {
@@ -67,14 +72,17 @@ internal class MoeTruyenUnofficial(context: MangaLoaderContext) :
 				response.newBuilder().body(bytes.toResponseBody(body.contentType())).build()
 			}
 		}
-		val client = context.httpClient.newBuilder()
+		// A bare client on purpose: the app's client injects its own cookies and
+		// challenge headers, which makes the reader-instance token disagree with
+		// the document cookie and the server answers 500.
+		val client = OkHttpClient.Builder()
 			.cookieJar(imgxCookieJar)
 			.cache(null)
+			.followRedirects(true)
+			.callTimeout(java.time.Duration.ofSeconds(45))
+			.addInterceptor(logging)
 			.build()
-		OkHttpWebClient(
-			client.newBuilder().addInterceptor(logging).build(),
-			source,
-		)
+		OkHttpWebClient(client, source)
 	}
 
 	private fun documentHeaders(): Headers = getRequestHeaders().newBuilder()
