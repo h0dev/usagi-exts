@@ -1,17 +1,51 @@
 package tsuki.site.wpcomics.vi
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.jsoup.nodes.Document
 import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
+import tsuki.config.ConfigKey
 import tsuki.model.*
 import tsuki.site.wpcomics.WpComicsParser
 import tsuki.util.*
+import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.*
 
 @MangaSourceParser("TOPTRUYEN", "TopTruyen", "vi")
 internal class TopTruyen(context: MangaLoaderContext) :
-	WpComicsParser(context, MangaParserSource.TOPTRUYEN, "www.toptruyenzone9.com", 36) {
+	WpComicsParser(context, MangaParserSource.TOPTRUYEN, DOMAIN_DISCOVERY_HOST, 36) {
+
+	override val configKeyDomain = ConfigKey.Domain(DOMAIN_DISCOVERY_HOST)
+
+	@Volatile
+	private var resolvedDomain: String? = null
+	private val domainMutex = Mutex()
+
+	private suspend fun currentDomain(): String {
+		resolvedDomain?.let { return it }
+		return domainMutex.withLock {
+			resolvedDomain?.let { return@withLock it }
+			val response = webClient.httpGet("https://$DOMAIN_DISCOVERY_HOST")
+			val host = URI(response.request.url.toString()).host
+				?.lowercase(Locale.ROOT)
+				?.takeIf { it.isNotBlank() }
+				?: DOMAIN_DISCOVERY_HOST
+			resolvedDomain = host
+			host
+		}
+	}
+
+	private suspend fun absoluteUrl(url: String): String {
+		if (url.startsWith("http://") || url.startsWith("https://")) {
+			val uri = runCatching { URI(url) }.getOrNull()
+			if (uri?.host?.contains("toptruyen", ignoreCase = true) != true) return url
+			val host = currentDomain()
+			return URI("https", uri.userInfo, host, -1, uri.path, uri.query, uri.fragment).toString()
+		}
+		return url.toAbsoluteUrl(currentDomain())
+	}
 
 	override val datePattern = "dd/MM/yyyy"
 
@@ -35,9 +69,10 @@ internal class TopTruyen(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val activeDomain = currentDomain()
 		val url = buildString {
 			append("https://")
-			append(domain)
+			append(activeDomain)
 			append("/tim-truyen")
 
 			if (filter.tags.isNotEmpty()) {
@@ -79,8 +114,9 @@ internal class TopTruyen(context: MangaLoaderContext) :
 		return parseMangaList(doc)
 	}
 
-	private fun parseMangaList(doc: Document): List<Manga> {
+	private suspend fun parseMangaList(doc: Document): List<Manga> {
 		val tags = availableTags()
+		val activeDomain = currentDomain()
 		return doc.select("div.item-manga").mapNotNull { div ->
 			val href = div.selectFirst("h3 a")?.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
 			val tagElements = div.select("p.info a[href*=tim-truyen]")
@@ -92,7 +128,7 @@ internal class TopTruyen(context: MangaLoaderContext) :
 			Manga(
 				id = generateUid(href),
 				url = href,
-				publicUrl = href.toAbsoluteUrl(div.host ?: domain),
+				publicUrl = href.toAbsoluteUrl(div.host ?: activeDomain),
 				coverUrl = div.selectFirst("div.image-item img.image-item")?.findImageUrl().orEmpty(),
 				title = div.selectFirst("h3 a")?.text().orEmpty(),
 				altTitles = emptySet(),
@@ -107,7 +143,7 @@ internal class TopTruyen(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val fullUrl = manga.url.toAbsoluteUrl(domain)
+		val fullUrl = absoluteUrl(manga.url)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 
 		val availableTags = availableTags()
@@ -153,7 +189,8 @@ internal class TopTruyen(context: MangaLoaderContext) :
 	override suspend fun getChapters(doc: Document, reversed: Boolean): List<MangaChapter> {
 		return doc.select("li.row:not([style*='display: none'])").mapChapters(reversed) { _, element ->
 			val chapterLink = element.selectFirst("a.chapter") ?: return@mapChapters null
-			val href = chapterLink.attrAsAbsoluteUrlOrNull("href") ?: return@mapChapters null
+			val absoluteHref = chapterLink.attrAsAbsoluteUrlOrNull("href") ?: return@mapChapters null
+			val href = runCatching { URI(absoluteHref).rawPath }.getOrNull() ?: absoluteHref
 			val name = chapterLink.text()
 			val number = chapterLink.attr("data-chapter").toFloatOrNull() ?: 0f
 			val timeElement = element.select("div.style-chap").firstOrNull()
@@ -213,7 +250,7 @@ internal class TopTruyen(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val fullUrl = chapter.url.toAbsoluteUrl(domain)
+		val fullUrl = absoluteUrl(chapter.url)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 		return doc.select("div.page-chapter img").mapNotNull { img ->
 			val url = img.attrAsRelativeUrlOrNull("src")
@@ -221,8 +258,9 @@ internal class TopTruyen(context: MangaLoaderContext) :
 				?: return@mapNotNull null
 
 			// Remove ads images, the first page may or may not contain ads
-			if (url.contains("toptruyentv.jpg") ||
+			if (url.contains(Regex("/comics/top/(?:topzone|toptruyen)[^/]*\\.(?:jpg|png|webp)(?:\\?|$)")) ||
 				url.contains("follow.png") ||
+				url.contains("luotnv.jpg") ||
 				url.contains("image_default.png") ||
 				url.contains("toptruyentv5.jpg") ||
 				url.contains("toptruyentv6.jpg") ||
@@ -246,6 +284,10 @@ internal class TopTruyen(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
+	}
+
+	private companion object {
+		const val DOMAIN_DISCOVERY_HOST = "toptruyen279.online"
 	}
 
 	private fun availableTags(): Set<MangaTag> = setOf(
